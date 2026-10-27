@@ -37,7 +37,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LE_ABI_VERSION		1
+#define LE_ABI_VERSION		2
 
 /* Arrow's C Data Interface, as its specification defines it */
 #ifndef ARROW_C_DATA_INTERFACE
@@ -277,7 +277,12 @@ typedef struct LeApi
 	int32_t		(*write_begin) (const char *uri, const char *storage_options_json,
 								LeDataset *base, struct ArrowSchema *schema,
 								const LeWriteSpec *spec, LeWrite **out, LeError *err);
-	/* a batch of the table's schema; the array is moved, the schema borrowed */
+	/*
+	 * A batch of the table's schema; the array is moved, the schema
+	 * borrowed.  A row id marked LE_ROWID_NEW_VERSION is a new version of
+	 * that row, an in-place UPDATE's: the row keeps its id, the version its
+	 * command and the commands after it see.
+	 */
 	int32_t		(*write_append) (LeWrite *w, struct ArrowArray *batch,
 								 struct ArrowSchema *schema, const uint64_t *row_ids,
 								 int64_t cid, uint32_t subxid, LeError *err);
@@ -333,7 +338,21 @@ typedef struct LeApi
 	int32_t		(*drop_columns) (LeDataset *ds, const char *const *names, int32_t n,
 								 const char *properties_json, uint64_t *new_version,
 								 LeError *err);
+
+	/*
+	 * Rows deleted by the transaction, as write_delete deletes them -- the
+	 * version of each the command sees -- read at the dataset's version
+	 * "version" (0: unknown): the commit deletes a committed row where that
+	 * version had it, and a version another writer put under its id since
+	 * is a conflict.
+	 */
+	int32_t		(*write_delete_read) (LeWrite *w, const uint64_t *row_ids, int64_t n,
+									  uint64_t version, int64_t cid, uint32_t subxid,
+									  LeError *err);
 } LeApi;
+
+/* write_append's mark on a row id: a new version of the row (bits 0..39) */
+#define LE_ROWID_NEW_VERSION	(UINT64_C(1) << 63)
 
 /* The library's one exported symbol */
 typedef const LeApi *(*lance_engine_api_fn) (uint32_t abi_version);

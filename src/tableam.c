@@ -8,10 +8,12 @@
  *	  share the version's fragments through an atomic counter in the DSM.
  *	  Writes go to xact.c, which commits them with the transaction.  A row's
  *	  TID is its row id (lance_tam.h), so TID scans, bitmap scans and the
- *	  indexes of PostgreSQL's own AMs work over the table; a row is never
- *	  changed in place, so a TID names one version of one row and there are
- *	  no update chains.  Rows are not locked: a write that loses to a
- *	  concurrent one fails at commit (§2.7).
+ *	  indexes of PostgreSQL's own AMs work over the table.  An UPDATE that
+ *	  changes no column an index reads keeps the row's TID, its new version
+ *	  under the row's id (update_in_place()), so that no index needs an
+ *	  entry for it; any other gives the row a new TID; there are no update
+ *	  chains: a TID's version is the one the snapshot sees.  Rows are not
+ *	  locked: a write that loses to a concurrent one fails at commit (§2.7).
  *
  *	  The relation's own storage is an empty main fork, made as heap makes
  *	  its own so that smgr and WAL see a relation like any other; the
@@ -39,6 +41,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_trigger.h"
 #include "common/pg_prng.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_am_d.h"
@@ -46,6 +49,7 @@
 #include "catalog/storage_xlog.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
+#include "commands/trigger.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
@@ -61,6 +65,7 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -506,11 +511,25 @@ lt_index_fetch_end(IndexFetchTableData *scan)
 	pfree(scan);
 }
 
+/*
+ * The row the backend fetched by TID last, and whether by a snapshot that
+ * sees its newest version (dirty, self, any) or by an MVCC one: of a row
+ * updated in place, a TID's version is the one its fetch found, as heap's
+ * TID names the version its index probe found (lt_tuple_lock()).
+ */
+static Oid	last_fetch_relid = InvalidOid;
+static uint64 last_fetch_rowid = 0;
+static bool last_fetch_newest = false;
+
 static bool
 fetch_one(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
 {
 	uint64		rowid;
 	bool		found = false;
+
+	last_fetch_relid = RelationGetRelid(rel);
+	last_fetch_rowid = lt_tid_valid(tid) ? lt_tid_to_rowid(tid) : 0;
+	last_fetch_newest = snapshot == NULL || !IsMVCCSnapshot(snapshot);
 
 	/*
 	 * A dirty snapshot reports the transactions a row waits on, which the
@@ -560,7 +579,10 @@ lt_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 static void
 lt_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 {
-	/* rows are never updated in place: a TID is its own latest version */
+	/*
+	 * A row updated in place keeps its TID; one updated otherwise is a new
+	 * row: a TID is its own latest version either way
+	 */
 }
 
 static bool
@@ -621,7 +643,7 @@ lt_tuple_complete_speculative(Relation rel, TupleTableSlot *slot, uint32 specTok
 {
 	/* a conflict found after the insert: the row goes again */
 	if (!succeeded)
-		lt_xact_delete(rel, lt_tid_to_rowid(&slot->tts_tid), GetCurrentCommandId(true));
+		lt_xact_delete(rel, lt_tid_to_rowid(&slot->tts_tid), GetCurrentCommandId(true), 0);
 }
 
 static void
@@ -634,11 +656,11 @@ lt_multi_insert(Relation rel, TupleTableSlot **slots, int nslots, CommandId cid,
 }
 
 static TM_Result
-self_modified(Relation rel, ItemPointer tid, TM_FailureData *tmfd)
+self_modified(Relation rel, ItemPointer tid, CommandId cid, TM_FailureData *tmfd)
 {
 	CommandId	dcid;
 
-	if (lt_xact_row_state(rel, lt_tid_to_rowid(tid), &dcid) == LE_WRITE_ROW_DELETED)
+	if (lt_xact_row_state(rel, lt_tid_to_rowid(tid), cid, &dcid) == LE_WRITE_ROW_DELETED)
 	{
 		tmfd->ctid = *tid;
 		tmfd->xmax = GetCurrentTransactionId();
@@ -653,13 +675,116 @@ static TM_Result
 lt_tuple_delete(Relation rel, ItemPointer tid, CommandId cid, uint32 options, Snapshot snapshot,
 				Snapshot crosscheck, bool wait, TM_FailureData *tmfd)
 {
-	TM_Result	r = self_modified(rel, tid, tmfd);
+	TM_Result	r = self_modified(rel, tid, cid, tmfd);
 
 	if (r != TM_Ok)
 		return r;
-	lt_xact_delete(rel, lt_tid_to_rowid(tid), cid);
+	lt_xact_delete(rel, lt_tid_to_rowid(tid), cid, lt_xact_read_version(rel, snapshot));
 	pgstat_count_heap_delete(rel);
 	return TM_Ok;
+}
+
+/* Whether a column has the same value in two rows, as heap_attr_equals has it */
+static bool
+attr_equal(TupleDesc desc, int attno, TupleTableSlot *a, TupleTableSlot *b)
+{
+	Form_pg_attribute att = TupleDescAttr(desc, attno - 1);
+
+	if (a->tts_isnull[attno - 1] || b->tts_isnull[attno - 1])
+		return a->tts_isnull[attno - 1] == b->tts_isnull[attno - 1];
+	return datum_image_eq(a->tts_values[attno - 1], b->tts_values[attno - 1], att->attbyval,
+						  att->attlen);
+}
+
+/*
+ * Whether an UPDATE keeps the row's TID, its new version written under the
+ * row's id: as pg_inplace_update_am decides an update in place (its
+ * DESIGN.md §7.4), so that, as heap's HOT update does, it leaves every
+ * index alone -- and an index scan that runs the UPDATE from its operator,
+ * its page locked, does not wait for the page itself.  No column an index
+ * reads may change (lt_table_inplace_blocking), and no trigger may need the
+ * row's OLD and NEW versions by their TIDs, which are then one: a user's
+ * AFTER ROW UPDATE trigger, a foreign key's on the referenced side whose
+ * check the update makes needed, an OLD transition table.  A foreign key's
+ * check on the referencing side reads NEW alone.
+ */
+static bool
+update_in_place(Relation rel, ItemPointer otid, TupleTableSlot *newslot)
+{
+	TriggerDesc *trigdesc = rel->trigdesc;
+	TupleDesc	desc = RelationGetDescr(rel);
+	Bitmapset  *blocking;
+	TupleTableSlot *oldslot;
+	bool		pk_checks = false;
+	bool		keep = true;
+	int			k = -1;
+
+	if (!lt_update_in_place)
+		return false;
+	if (trigdesc && trigdesc->trig_update_old_table)
+		return false;
+	if (trigdesc && trigdesc->trig_update_after_row)
+	{
+		for (int i = 0; i < trigdesc->numtriggers; i++)
+		{
+			Trigger    *trig = &trigdesc->triggers[i];
+
+			if (!TRIGGER_TYPE_MATCHES(trig->tgtype, TRIGGER_TYPE_ROW, TRIGGER_TYPE_AFTER,
+									  TRIGGER_TYPE_UPDATE) ||
+				trig->tgenabled == TRIGGER_DISABLED)
+				continue;
+			switch (RI_FKey_trigger_type(trig->tgfoid))
+			{
+				case RI_TRIGGER_FK:
+					break;
+				case RI_TRIGGER_PK:
+					pk_checks = true;
+					break;
+				default:
+					return false;
+			}
+		}
+	}
+	blocking = lt_table_inplace_blocking(rel);
+	if (blocking == NULL && !pk_checks)
+		return true;
+
+	/* the version updated, as the update's scan read it */
+	oldslot = MakeSingleTupleTableSlot(desc, lt_slot_ops_of());
+	if (!fetch_one(rel, otid, SnapshotAny, oldslot))
+	{
+		ExecDropSingleTupleTableSlot(oldslot);
+		return false;
+	}
+	slot_getallattrs(oldslot);
+	slot_getallattrs(newslot);
+	while (keep && (k = bms_next_member(blocking, k)) >= 0)
+	{
+		AttrNumber	attno = k + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno > 0)
+			keep = attr_equal(desc, attno, oldslot, newslot);
+		else if (attno == InvalidAttrNumber)
+		{
+			/* an index's expression reads the whole row */
+			for (int a = 1; keep && a <= desc->natts; a++)
+				if (!TupleDescAttr(desc, a - 1)->attisdropped)
+					keep = attr_equal(desc, a, oldslot, newslot);
+		}
+	}
+	for (int i = 0; keep && pk_checks && i < trigdesc->numtriggers; i++)
+	{
+		Trigger    *trig = &trigdesc->triggers[i];
+
+		if (TRIGGER_TYPE_MATCHES(trig->tgtype, TRIGGER_TYPE_ROW, TRIGGER_TYPE_AFTER,
+								 TRIGGER_TYPE_UPDATE) &&
+			trig->tgenabled != TRIGGER_DISABLED &&
+			RI_FKey_trigger_type(trig->tgfoid) == RI_TRIGGER_PK &&
+			RI_FKey_pk_upd_check_required(trig, rel, oldslot, newslot))
+			keep = false;
+	}
+	ExecDropSingleTupleTableSlot(oldslot);
+	return keep;
 }
 
 static TM_Result
@@ -667,7 +792,9 @@ lt_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot, CommandId 
 				Snapshot snapshot, Snapshot crosscheck, bool wait, TM_FailureData *tmfd,
 				LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
-	TM_Result	r = self_modified(rel, otid, tmfd);
+	TM_Result	r = self_modified(rel, otid, cid, tmfd);
+	uint64		rowid = lt_tid_to_rowid(otid);
+	bool		in_place;
 
 	*lockmode = LockTupleExclusive;
 	if (r != TM_Ok)
@@ -675,10 +802,20 @@ lt_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot, CommandId 
 		*update_indexes = TU_None;
 		return r;
 	}
-	lt_xact_delete(rel, lt_tid_to_rowid(otid), cid);
-	lt_xact_insert(rel, slot, cid);
-	*update_indexes = TU_All;
-	pgstat_count_heap_update(rel, false, false);
+	in_place = update_in_place(rel, otid, slot);
+	lt_xact_delete(rel, rowid, cid, lt_xact_read_version(rel, snapshot));
+	if (in_place)
+	{
+		/* the row keeps its TID: no index needs an entry */
+		lt_xact_insert_version(rel, slot, cid, rowid);
+		*update_indexes = TU_None;
+	}
+	else
+	{
+		lt_xact_insert(rel, slot, cid);
+		*update_indexes = TU_All;
+	}
+	pgstat_count_heap_update(rel, in_place, false);
 	return TM_Ok;
 }
 
@@ -691,10 +828,26 @@ lt_tuple_lock(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *
 			  CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, uint8 flags,
 			  TM_FailureData *tmfd)
 {
-	TM_Result	r = self_modified(rel, tid, tmfd);
+	TM_Result	r = self_modified(rel, tid, cid, tmfd);
 
 	if (r != TM_Ok)
+	{
+		/*
+		 * A row the command updated in place, found by a probe that sees
+		 * the newest version (ON CONFLICT's, by a dirty snapshot): the TID
+		 * names the version the update made, which the command does not
+		 * see, as heap's lock of that version finds it invisible -- and ON
+		 * CONFLICT DO UPDATE refuses to change the row again.  Found by an
+		 * MVCC snapshot (a foreign key's check, whose operator updated the
+		 * row), the TID names the version the snapshot read, which heap's
+		 * lock reports TM_SelfModified.
+		 */
+		if (r == TM_SelfModified && tmfd->cmax == cid && last_fetch_newest &&
+			last_fetch_relid == RelationGetRelid(rel) &&
+			last_fetch_rowid == lt_tid_to_rowid(tid) && fetch_one(rel, tid, SnapshotSelf, slot))
+			return TM_Invisible;
 		return r;
+	}
 	if (!fetch_one(rel, tid, snapshot, slot))
 	{
 		tmfd->ctid = *tid;

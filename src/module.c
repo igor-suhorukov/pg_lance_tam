@@ -44,6 +44,7 @@ int			lt_refine_factor = 0;
 bool		lt_enable_customscan = true;
 bool		lt_enable_ann = true;
 bool		lt_enable_filter_pushdown = true;
+bool		lt_update_in_place = true;
 bool		lt_scan_in_order = true;
 bool		lt_vacuum_compact = true;
 int			lt_version_retention = 3600;
@@ -110,6 +111,10 @@ _PG_init(void)
 	DefineCustomBoolVariable("lance.enable_filter_pushdown",
 							 "Give a scan's quals to Lance as a filter.",
 							 NULL, &lt_enable_filter_pushdown, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("lance.update_in_place",
+							 "An UPDATE that changes no indexed column keeps the row's TID, so that no index needs an entry for it.",
+							 "Off: every UPDATE gives the row a new TID, as before.",
+							 &lt_update_in_place, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("lance.scan_in_order",
 							 "Read a table's rows in the dataset's order, its fragments' and theirs.",
 							 "Off lets Lance hand batches over as they are decoded.",

@@ -275,8 +275,8 @@ flush_deletes(LtXactTable *xt)
 
 	if (xt->ndeletes == 0)
 		return;
-	if (lt_api()->write_delete(xt->write, xt->deletes, xt->ndeletes, (int64) xt->delete_cid,
-							   xt->delete_subxid, &err) != LE_OK)
+	if (lt_api()->write_delete_read(xt->write, xt->deletes, xt->ndeletes, xt->delete_version,
+									(int64) xt->delete_cid, xt->delete_subxid, &err) != LE_OK)
 		lt_raise(&err, "deleting rows of a lance table");
 	xt->ndeletes = 0;
 }
@@ -296,12 +296,16 @@ lt_xact_flush_rel(Relation rel)
 	lt_xact_flush(lt_xact_table_by_relid(RelationGetRelid(rel)));
 }
 
-void
-lt_xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
+/*
+ * A row into the batch being formed: a new row, under a new id, or with
+ * "version" set, a new version of row "rowid", an in-place UPDATE's, which
+ * keeps the row's id and so its TID (the engine's LE_ROWID_NEW_VERSION).
+ */
+static void
+xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid, bool version)
 {
 	LtXactTable *xt = lt_xact_table(rel, true);
 	SubTransactionId subxid = GetCurrentSubTransactionId();
-	uint64		rowid;
 
 	lt_xact_write(rel, xt);
 	if (xt->builder && lt_builder_rows(xt->builder) > 0 &&
@@ -317,14 +321,53 @@ lt_xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
 	xt->builder_cid = cid;
 	xt->builder_subxid = subxid;
 
-	rowid = lt_next_rowid();
+	if (!version)
+		rowid = lt_next_rowid();
 	lt_rowid_to_tid(rowid, &slot->tts_tid);
 	slot->tts_tableOid = RelationGetRelid(rel);
-	lt_builder_add(xt->builder, slot, rowid);
+	lt_builder_add(xt->builder, slot, version ? rowid | LE_ROWID_NEW_VERSION : rowid);
 	xt->rows_inserted++;
 	if (lt_builder_rows(xt->builder) >= lt_batch_rows ||
 		lt_builder_bytes(xt->builder) >= (Size) 64 * 1024 * 1024)
 		flush_builder(xt);
+}
+
+void
+lt_xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid)
+{
+	xact_insert(rel, slot, cid, 0, false);
+}
+
+/* A new version of a row, under the row's id: an in-place UPDATE's */
+void
+lt_xact_insert_version(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid)
+{
+	xact_insert(rel, slot, cid, rowid, true);
+}
+
+/*
+ * The dataset version a write's snapshot reads, at which its command read
+ * the committed rows it deletes: the commit deletes them where that version
+ * has them (lt_xact_delete); 0 for a snapshot that is not MVCC.
+ */
+uint64
+lt_xact_read_version(Relation rel, Snapshot snapshot)
+{
+	LtXactTable *xt = lt_xact_table(rel, true);
+
+	if (snapshot == NULL || !IsMVCCSnapshot(snapshot))
+		return 0;
+	if (xt->read_snapshot != snapshot || xt->read_xmin != snapshot->xmin ||
+		xt->read_curcid != snapshot->curcid ||
+		xt->read_completion != snapshot->snapXactCompletionCount || xt->read_version == 0)
+	{
+		xt->read_version = lt_snapshot_version(rel, lt_table(rel), snapshot);
+		xt->read_snapshot = snapshot;
+		xt->read_xmin = snapshot->xmin;
+		xt->read_curcid = snapshot->curcid;
+		xt->read_completion = snapshot->snapXactCompletionCount;
+	}
+	return xt->read_version;
 }
 
 /* The rows the running command deleted, to tell a second delete of one */
@@ -358,18 +401,22 @@ cmd_note_deleted(LtXactTable *xt, uint64 rowid, CommandId cid)
 
 /*
  * LE_WRITE_ROW_DELETED with the command that deleted it, when this
- * transaction deleted the row; else LE_WRITE_ROW_NONE.
+ * transaction's command "cid" or a later one -- a trigger's, under it --
+ * deleted the row the command sees; else LE_WRITE_ROW_NONE.  A deletion by
+ * an earlier command took a version the command does not see: the row
+ * updated in place by it keeps its TID for the version it made.
  */
 int
-lt_xact_row_state(Relation rel, uint64 rowid, CommandId *cid)
+lt_xact_row_state(Relation rel, uint64 rowid, CommandId cid, CommandId *dcid)
 {
 	LtXactTable *xt = lt_xact_table_by_relid(RelationGetRelid(rel));
 
 	if (xt == NULL)
 		return LE_WRITE_ROW_NONE;
-	if (xt->cmd_deleted && hash_search(xt->cmd_deleted, &rowid, HASH_FIND, NULL))
+	if (xt->cmd_deleted && xt->cmd_cid >= cid &&
+		hash_search(xt->cmd_deleted, &rowid, HASH_FIND, NULL))
 	{
-		*cid = xt->cmd_cid;
+		*dcid = xt->cmd_cid;
 		return LE_WRITE_ROW_DELETED;
 	}
 	return LE_WRITE_ROW_NONE;
@@ -391,16 +438,21 @@ lt_xact_row_is_own(Oid relid, uint64 rowid)
 		const uint64 *ids = lt_builder_rowids(xt->builder);
 
 		for (int64 i = 0; i < lt_builder_rows(xt->builder); i++)
-			if (ids[i] == rowid)
+			if ((ids[i] & ~LE_ROWID_NEW_VERSION) == rowid)
 				return true;
 	}
-	if (lt_api()->write_row_state(xt->write, rowid, 0, &state, &state_cid, &err) != LE_OK)
+	/* the row's newest version: an in-place update's is the transaction's */
+	if (lt_api()->write_row_state(xt->write, rowid, -1, &state, &state_cid, &err) != LE_OK)
 		lt_raise(&err, "reading a row's state");
 	return state == LE_WRITE_ROW_APPENDED;
 }
 
+/*
+ * A row deleted, the version of it the command sees; "version" is the
+ * dataset version the command read the table at, 0 when unknown.
+ */
 void
-lt_xact_delete(Relation rel, uint64 rowid, CommandId cid)
+lt_xact_delete(Relation rel, uint64 rowid, CommandId cid, uint64 version)
 {
 	LtXactTable *xt = lt_xact_table(rel, true);
 	SubTransactionId subxid = GetCurrentSubTransactionId();
@@ -410,7 +462,8 @@ lt_xact_delete(Relation rel, uint64 rowid, CommandId cid)
 		return;
 	/* the row may still be in the batch being formed */
 	flush_builder(xt);
-	if (xt->ndeletes > 0 && (xt->delete_cid != cid || xt->delete_subxid != subxid))
+	if (xt->ndeletes > 0 &&
+		(xt->delete_cid != cid || xt->delete_subxid != subxid || xt->delete_version != version))
 		flush_deletes(xt);
 	if (xt->ndeletes >= xt->deletes_cap)
 	{
@@ -425,6 +478,7 @@ lt_xact_delete(Relation rel, uint64 rowid, CommandId cid)
 	xt->deletes[xt->ndeletes++] = rowid;
 	xt->delete_cid = cid;
 	xt->delete_subxid = subxid;
+	xt->delete_version = version;
 	xt->rows_deleted++;
 	cmd_note_deleted(xt, rowid, cid);
 	if (xt->ndeletes >= DELETE_FLUSH_ROWS)

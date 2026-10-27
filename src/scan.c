@@ -16,10 +16,11 @@
  *	  relation holds when the row is in it -- ModifyTable fetches the row an
  *	  UPDATE changes, or a DELETE with RETURNING or row triggers removes,
  *	  right after its scan read it -- and from the engine's take otherwise.
- *	  A row id names one version of a row, never changed, so the batch's
- *	  values are the row's whichever snapshot asks; the snapshot decides
- *	  only whether the row is visible, and the batch's reader read it with
- *	  its own.
+ *	  A row updated in place keeps its id, so a row id names the row's
+ *	  versions, the take giving the one the snapshot sees; a batch serves
+ *	  the fetches of its reader's snapshot, which sees the version it read,
+ *	  and SnapshotAny's, which ModifyTable's of the row its scan just read
+ *	  are.
  *
  * SPDX-License-Identifier: Apache-2.0
  *

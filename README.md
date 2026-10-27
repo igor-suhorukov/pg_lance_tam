@@ -30,9 +30,10 @@ As of 2026-10-27, built and tested against:
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
 - Every leg of `test/run.sh` passes: `checks` (the ABI's two
-  declarations agree), `engine`, `suite` (11 files: basic, types, dml,
+  declarations agree), `engine`, `suite` (12 files: basic, types, dml,
   search, indexes, datasets, schema, concurrency, encoding, pushdown,
-  parallel), `recovery`, `s3` (LocalStack), `interop` (pylance), `vexec`.
+  parallel, inplace), `recovery`, `s3` (LocalStack), `interop` (pylance),
+  `vexec`.
 - PostgreSQL's own regression suite with `default_table_access_method =
   lance` ran all 239 of its files on 19beta3 with no crash, failed
   assertion or PANIC.  116 files differ from heap's expected output (160
@@ -40,12 +41,13 @@ As of 2026-10-27, built and tested against:
   orders), by what is refused (below) and the statements after it that
   depend on it, by row order and TIDs, and by the semantics stated under
   [Transactions](#transactions-and-concurrency) and [Limits](#limits).
-- On 19rc1 a check new to `foreign_key.sql` hangs: its equality function
-  updates the referenced row while the foreign key's check holds the
-  unique index's page locked, which on heap is a HOT update; a lance
-  UPDATE gives the row a new TID and inserts into that page, and the
-  backend waits on its own buffer lock.  The `pgregress` leg runs the
-  suite without that block.
+- On 19rc1 (its build has no assertions) all 239 files run with no crash
+  or PANIC; 117 differ, the one more a new check of `sqljson_queryfuncs`
+  that counts TOAST chunks, which lance tables have none of.  A check new
+  to `foreign_key.sql` -- an equality function that updates the
+  referenced row while the foreign key's check holds the unique index's
+  page locked -- passes since UPDATEs keep TIDs in place: a lance UPDATE
+  used to insert into that page, and the backend waited on its own lock.
 
 ## What it does
 
@@ -53,6 +55,10 @@ As of 2026-10-27, built and tested against:
   (`s3://bucket/prefix/table.lance`): a new table makes its dataset, or
   attaches one that exists -- written by Lance's Python package, say --
   taking its columns.
+- **In-place updates**: an UPDATE that changes no indexed column keeps the
+  row's TID, as pg_inplace_update_am's in-place updates and heap's HOT
+  updates do, so that no index needs an entry for the new version;
+  `lance.update_in_place = off` gives every UPDATE a new TID.
 - **All of PostgreSQL's DML**: INSERT, COPY, UPDATE, DELETE, MERGE,
   `INSERT ... ON CONFLICT`, TRUNCATE, cursors, TID scans, triggers,
   constraints, foreign keys both ways, row-level security, partitions.
@@ -311,6 +317,7 @@ gains little: Lance's filter already runs on its threads.
 | `lance.nprobes`, `lance.ef`, `lance.refine_factor` | Lance's | vector search |
 | `lance.enable_customscan`, `lance.enable_ann`, `lance.enable_filter_pushdown` | on | LanceScan, its searches, its filters |
 | `lance.scan_start_cost` | 100 | the planner's cost of starting a Lance scan, which each scan of a nested loop's parameterized LanceScan pays |
+| `lance.update_in_place` | on | an UPDATE that changes no indexed column keeps the row's TID |
 | `lance.scan_in_order` | on | rows in the order they were written, as heap's mostly are |
 | `lance.vacuum_compact` | on | VACUUM compacts the dataset |
 | `lance.version_retention` | 3600 s | the versions VACUUM keeps; -1 keeps all |
@@ -423,8 +430,10 @@ Lance scan costs about a millisecond to set up.
   a concurrent writer of the row; the later commit fails with 40001, under
   every isolation level.
 - `xmin` of a row the transaction inserted is the top transaction's, of
-  any other row frozen; `cmin` and `cmax` are 0.  TIDs are the rows' stable
-  ids, from block 2^31 up.
+  any other row frozen; `cmin` and `cmax` are 0.  An UPDATE that changes no
+  indexed column keeps the row's TID; one that changes one, or that an
+  AFTER ROW trigger would refetch by TID, gives it a new one.  TIDs are
+  the rows' stable ids, from block 2^31 up.
 - Backward scans: a cursor over LanceScan is materialized when declared
   `SCROLL` (and is then not the scan `WHERE CURRENT OF` finds), and refuses
   `FETCH BACKWARD` otherwise.

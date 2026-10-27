@@ -17,18 +17,6 @@ ${LT_SETTINGS:-}"
 # end the leg before its summary
 set +e +o pipefail
 R=/cb/pgregress/src/test/regress
-# A check new in 19rc1's foreign_key.sql never ends on lance tables: its
-# equality function updates the referenced row while the check holds the
-# unique index's page locked -- a HOT update on heap, on lance an insertion
-# into that page -- and the backend waits for its own buffer lock.  The leg
-# runs a copy of the suite without that block (README, Status).
-cp -a "$R" /tmp/pgregress-src
-R=/tmp/pgregress-src
-sed -i '/^-- The row lock must use the command ID/,/^ROLLBACK;$/d' "$R/sql/foreign_key.sql"
-if grep -q fp_fk_cid "$R/sql/foreign_key.sql"; then
-	echo "pgregress.sh: foreign_key.sql's fp_cid block is still there" >&2
-	exit 1
-fi
 PG_REGRESS="$(dirname "$(pg_config --pgxs)")/../test/regress/pg_regress"
 PSQL=(psql -X -q -At -v ON_ERROR_STOP=1)
 

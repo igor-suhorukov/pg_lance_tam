@@ -73,6 +73,7 @@ extern double lt_scan_start_cost;
 extern bool lt_enable_customscan;
 extern bool lt_enable_ann;
 extern bool lt_enable_filter_pushdown;
+extern bool lt_update_in_place;
 extern bool lt_scan_in_order;
 extern bool lt_vacuum_compact;
 extern int	lt_version_retention;
@@ -170,6 +171,7 @@ typedef struct LtVersionInfo
 } LtVersionInfo;
 
 extern LtVersionInfo *lt_version_info(Relation rel, uint64 version);
+extern Bitmapset *lt_table_inplace_blocking(Relation rel);
 
 /* convert.c: attributes as Arrow columns (§2.5) */
 typedef enum LtKind
@@ -379,6 +381,13 @@ typedef struct LtXactTable
 	int			deletes_cap;
 	CommandId	delete_cid;
 	SubTransactionId delete_subxid;
+	uint64		delete_version; /* the dataset version they were read at */
+	/* the version a write's snapshot reads (lt_xact_read_version) */
+	Snapshot	read_snapshot;
+	TransactionId read_xmin;
+	CommandId	read_curcid;
+	uint64		read_completion;
+	uint64		read_version;
 	/* the rows the running command deleted */
 	HTAB	   *cmd_deleted;
 	CommandId	cmd_cid;
@@ -395,7 +404,10 @@ extern LeWrite *lt_xact_write(Relation rel, LtXactTable *xt);
 extern void lt_xact_flush(LtXactTable *xt);
 extern void lt_xact_flush_rel(Relation rel);
 extern void lt_xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid);
-extern void lt_xact_delete(Relation rel, uint64 rowid, CommandId cid);
+extern void lt_xact_insert_version(Relation rel, TupleTableSlot *slot, CommandId cid,
+								   uint64 rowid);
+extern void lt_xact_delete(Relation rel, uint64 rowid, CommandId cid, uint64 version);
+extern uint64 lt_xact_read_version(Relation rel, Snapshot snapshot);
 extern void lt_xact_note_created(Oid relid, const char *uri, const char *storage_json, bool managed);
 extern void lt_xact_note_dropped(Oid relid, const char *uri, const char *storage_json, bool managed);
 extern bool lt_xact_committing(void);
@@ -403,7 +415,7 @@ extern double lt_xact_rows(Oid relid, double committed);
 extern void lt_xact_add_columns(Oid relid, List *attnums);
 extern void lt_xact_drop_columns(Oid relid, List *attnums);
 extern void lt_xact_truncate_committed(Relation rel);
-extern int	lt_xact_row_state(Relation rel, uint64 rowid, CommandId *cid);
+extern int	lt_xact_row_state(Relation rel, uint64 rowid, CommandId cid, CommandId *dcid);
 extern bool lt_xact_row_is_own(Oid relid, uint64 rowid);
 extern char *lt_xact_properties(Oid relid);
 extern uint64 lt_commit_base(Oid relid, const char *uri, const char *storage_json,

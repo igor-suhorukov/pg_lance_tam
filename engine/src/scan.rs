@@ -185,6 +185,8 @@ struct Post {
     extras: Vec<&'static str>,
     hide: Option<RoaringTreemap>,
     keep_row_id: bool,
+    /// rows updated in place: their versions' ids given back as the rows'
+    versions: bool,
     /// limit and offset applied here, when hidden rows keep them from Lance
     limit: Option<i64>,
     offset: i64,
@@ -222,6 +224,9 @@ impl Post {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
+        if self.versions && self.keep_row_id {
+            batch = public_row_ids(batch)?;
+        }
         let mut extras = self.extras.clone();
         if !self.keep_row_id {
             extras.retain(|e| *e != lance_core::ROW_ID);
@@ -232,6 +237,28 @@ impl Post {
     fn finished(&self) -> bool {
         self.limit.is_some_and(|l| self.emitted >= l)
     }
+}
+
+/// A batch with an in-place version's row id given back as its row's
+fn public_row_ids(batch: RecordBatch) -> EResult<RecordBatch> {
+    let Ok(idx) = batch.schema().index_of(lance_core::ROW_ID) else {
+        return Ok(batch);
+    };
+    let ids = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| EngineError::internal("the _rowid column is not uint64"))?;
+    if !ids.iter().any(|id| id.is_some_and(|v| v > crate::write::ROW_ID_MASK)) {
+        return Ok(batch);
+    }
+    let public: UInt64Array = ids
+        .iter()
+        .map(|id| id.map(|v| v & crate::write::ROW_ID_MASK))
+        .collect();
+    let mut columns = batch.columns().to_vec();
+    columns[idx] = Arc::new(public);
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 fn wanted_fields(ds: &Dataset, spec: &ScanSpec) -> EResult<Vec<Field>> {
@@ -351,6 +378,7 @@ async fn build(ds: Arc<Dataset>, spec: &ScanSpec) -> EResult<(Scanner, Post)> {
         extras,
         hide: hide.clone(),
         keep_row_id: spec.with_row_id,
+        versions: view.as_ref().is_some_and(|v| v.versions),
         limit: None,
         offset: 0,
         seen: 0,
@@ -469,13 +497,16 @@ pub async fn take(ds: Arc<Dataset>, spec: ScanSpec, row_ids: Vec<u64>) -> EResul
         truncated = view.truncated;
         // The transaction's own rows, by fragment and offset.
         let mut by_fragment: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
+        // A row updated in place: the version the command sees
         for &id in &row_ids {
-            if view.hide.contains(id) {
+            let version = w.resolve(id, spec.cid);
+            if view.hide.contains(version) {
                 continue;
             }
-            match w.locate(id) {
+            match w.locate(version) {
                 Some((fi, pos)) => by_fragment.entry(fi).or_default().push((pos as u32, id)),
-                None => committed.push(id),
+                None if version == id => committed.push(id),
+                None => {}
             }
         }
         for (fi, mut rows) in by_fragment {

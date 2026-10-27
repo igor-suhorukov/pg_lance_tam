@@ -25,9 +25,11 @@
  */
 #include "postgres.h"
 
+#include "access/amapi.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
@@ -40,6 +42,7 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "optimizer/optimizer.h"
 #include "storage/lmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -201,6 +204,9 @@ typedef struct TableEntry
 	/* what the planner asked last of a version (lt_version_info), in a child of cxt */
 	LtVersionInfo *vinfo;
 	MemoryContext vinfo_cxt;
+	/* the columns an in-place UPDATE may not change, in cxt */
+	bool		blocking_known;
+	Bitmapset  *blocking;
 } TableEntry;
 
 static HTAB *tables = NULL;
@@ -214,6 +220,8 @@ table_entry_drop(TableEntry *e)
 	e->table = NULL;
 	e->vinfo = NULL;
 	e->vinfo_cxt = NULL;
+	e->blocking_known = false;
+	e->blocking = NULL;
 }
 
 void
@@ -541,6 +549,8 @@ lt_table_by_relid(Oid relid, bool missing_ok)
 	e->cxt = cxt;
 	e->vinfo = NULL;
 	e->vinfo_cxt = NULL;
+	e->blocking_known = false;
+	e->blocking = NULL;
 	return t;
 }
 
@@ -574,6 +584,62 @@ lt_table_copy_by_relid(Oid relid, bool missing_ok)
 	LtTable    *t = lt_table_by_relid(relid, missing_ok);
 
 	return t ? table_copy(t) : NULL;
+}
+
+/*
+ * The columns an in-place UPDATE may not change (tableam.c), NULL for none:
+ * every column an index reads -- its keys and included columns, its
+ * expressions', its predicate's -- as heap's HOT-blocking columns are
+ * (RelationGetIndexAttrBitmap), but a lance_index's, whose entries are
+ * Lance's, and a summarizing index's.  Kept with the table's row: creating
+ * or dropping an index invalidates the relation.
+ */
+Bitmapset *
+lt_table_inplace_blocking(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	TableEntry *e;
+	List	   *indexes;
+	ListCell   *lc;
+	Bitmapset  *attrs = NULL;
+
+	(void) lt_table_by_relid(relid, false);
+	e = hash_search(tables, &relid, HASH_FIND, NULL);
+	if (e && e->table && e->blocking_known)
+		return bms_copy(e->blocking);
+	indexes = RelationGetIndexList(rel);
+	foreach(lc, indexes)
+	{
+		Relation	index = index_open(lfirst_oid(lc), AccessShareLock);
+
+		if (!lt_is_lance_index_am(index->rd_rel->relam) && !index->rd_indam->amsummarizing)
+		{
+			Form_pg_index form = index->rd_index;
+
+			for (int i = 0; i < form->indnatts; i++)
+			{
+				if (form->indkey.values[i] != 0)
+					attrs = bms_add_member(attrs, form->indkey.values[i] -
+										   FirstLowInvalidHeapAttributeNumber);
+			}
+			pull_varattnos((Node *) RelationGetIndexExpressions(index), 1, &attrs);
+			pull_varattnos((Node *) RelationGetIndexPredicate(index), 1, &attrs);
+		}
+		index_close(index, AccessShareLock);
+	}
+	list_free(indexes);
+
+	/* an invalidation while the indexes were opened may have dropped the entry */
+	e = hash_search(tables, &relid, HASH_FIND, NULL);
+	if (e && e->table)
+	{
+		MemoryContext old = MemoryContextSwitchTo(e->cxt);
+
+		e->blocking = bms_copy(attrs);
+		e->blocking_known = true;
+		MemoryContextSwitchTo(old);
+	}
+	return attrs;
 }
 
 /* ------------------------------------------------------------------------

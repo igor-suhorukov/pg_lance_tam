@@ -28,7 +28,7 @@ use crate::rt::run;
 use crate::scan::{LeScan, ScanSpec};
 use crate::write::{LeWrite, RowState, Spec};
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 
 static LIBRARY_VERSION: LazyLock<CString> = LazyLock::new(|| {
     CString::new(format!(
@@ -523,7 +523,32 @@ unsafe extern "C" fn le_write_delete(
                 return Ok(());
             };
             run(async move {
-                inner.lock().await.delete(&ids, cid, subxid);
+                inner.lock().await.delete(&ids, 0, cid, subxid);
+                Ok(())
+            })
+        })
+    }
+}
+
+unsafe extern "C" fn le_write_delete_read(
+    w: *mut LeWrite,
+    row_ids: *const u64,
+    n: i64,
+    version: u64,
+    cid: i64,
+    subxid: u32,
+    err: *mut LeError,
+) -> i32 {
+    unsafe {
+        guard(err, || {
+            let inner = write_ref(w)?.inner.clone();
+            let ids = if n > 0 {
+                std::slice::from_raw_parts(row_ids, n as usize).to_vec()
+            } else {
+                return Ok(());
+            };
+            run(async move {
+                inner.lock().await.delete(&ids, version, cid, subxid);
                 Ok(())
             })
         })
@@ -533,7 +558,7 @@ unsafe extern "C" fn le_write_delete(
 unsafe extern "C" fn le_write_row_state(
     w: *mut LeWrite,
     row_id: u64,
-    _cid: i64,
+    cid: i64,
     state: *mut i32,
     state_cid: *mut i64,
     err: *mut LeError,
@@ -541,7 +566,7 @@ unsafe extern "C" fn le_write_row_state(
     unsafe {
         guard(err, || {
             let inner = write_ref(w)?.inner.clone();
-            let s = run(async move { Ok(inner.lock().await.row_state(row_id)) })?;
+            let s = run(async move { Ok(inner.lock().await.row_state(row_id, cid)) })?;
             let (st, c) = match s {
                 RowState::None => (LE_WRITE_ROW_NONE, -1),
                 RowState::Appended => (LE_WRITE_ROW_APPENDED, -1),
@@ -890,6 +915,8 @@ pub struct LeApi {
         *mut u64,
         *mut LeError,
     ) -> i32,
+    write_delete_read:
+        unsafe extern "C" fn(*mut LeWrite, *const u64, i64, u64, i64, u32, *mut LeError) -> i32,
 }
 
 // SAFETY: the table holds function pointers and a pointer to a static string.
@@ -938,6 +965,7 @@ static API: LazyLock<LeApi> = LazyLock::new(|| LeApi {
     cleanup: le_cleanup,
     add_columns: le_add_columns,
     drop_columns: le_drop_columns,
+    write_delete_read: le_write_delete_read,
 });
 
 /// The table of entry points, or NULL when the caller was built for
