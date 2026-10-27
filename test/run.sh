@@ -7,6 +7,8 @@
 # server on the host; it needs docker with Compose v2 and BuildKit.
 #
 #   run.sh images        the builder and dev images
+#   run.sh assert-image  the dev image with assertions: PostgreSQL built
+#                        from its source release with --enable-cassert
 #   run.sh fetch         cargo fetch for the engine (the only leg with the
 #                        network)
 #   run.sh engine        the engine library, ~/.cache/pg_accel/lance_tam/engine
@@ -37,6 +39,8 @@
 #   LT_LANCE_SRC  Lance's checkout: ~/dev/projects/oss_databases/github/lance
 #   LT_PG_ACCEL   pg_accel's tree, for vexec
 #   LT_RUN        repro: the run directory that holds repro1.sql
+#   LT_DEV_IMAGE  the image the legs run on: lance_tam/dev:19rc1-trixie;
+#                 lance_tam/dev:19rc1-assert for assertions
 set -u -o pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,6 +71,8 @@ leg() {
 case "${1:-}" in
 	images)
 		compose --profile build build lt-engine-builder lt-dev-vanilla ;;
+	assert-image)
+		compose --profile build build lt-dev-assert ;;
 	fetch)
 		leg fetch engine-fetch /src/test/engine.sh fetch ;;
 	engine)

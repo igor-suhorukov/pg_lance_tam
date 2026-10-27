@@ -15,6 +15,10 @@
 #                      packages on Debian trixie) with PGXS, pgvector,
 #                      pylance and PostgreSQL's regression suite; postgres
 #                      takes the host user's uid (LT_UID)
+#   lt-dev-assert      Dockerfile.assert: PostgreSQL 19 (LT_PG_VERSION:
+#                      19rc1) built from its source release with
+#                      assertions, with the same additions; a leg runs on
+#                      it with LT_DEV_IMAGE=lance_tam/dev:19rc1-assert
 #   vanilla            a leg's container on it: the tree read-only at /src,
 #                      its run's directory at /work, the engine library at
 #                      /engine, the pg_accel tree (for vexec) at /pg_accel,
@@ -94,9 +98,19 @@ services:
         LT_UID: ${LT_UID:-1000}
     profiles: ["build"]
 
+  lt-dev-assert:
+    image: lance_tam/dev:${LT_PG_VERSION:-19rc1}-assert
+    build:
+      context: .
+      dockerfile: Dockerfile.assert
+      args:
+        PG_VERSION: ${LT_PG_VERSION:-19rc1}
+        LT_UID: ${LT_UID:-1000}
+    profiles: ["build"]
+
   vanilla:
     <<: *run
-    image: lance_tam/dev:${LT_PG_TAG:-19rc1-trixie}
+    image: ${LT_DEV_IMAGE:-lance_tam/dev:${LT_PG_TAG:-19rc1-trixie}}
     networks: [legs]
     profiles: ["run"]
 

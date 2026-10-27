@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# lance_tam's dev image with assertions (docs/design.md §6): PostgreSQL 19
+# built from its source release with --enable-cassert, for the legs to run
+# on as they do on Dockerfile.dev's PGDG build, which has none.  Debian
+# trixie, the engine builder's release, so that the engine library asks for
+# no newer glibc than the server has.
+#
+#   PG_VERSION=19rc1   the source release, checked against its SHA-256 as
+#                      ftp.postgresql.org gives it
+#   LT_UID=1000        postgres's uid and gid, the host user's
+#
+# The server goes to /usr/local/pgsql with the contrib modules the legs use
+# (dblink among them); beside it pgvector at PGVECTOR_REF, pylance for the
+# interop leg, and PostgreSQL's own regression suite and the libraries it
+# loads (regress, and contrib/spi's refint and autoinc) in /cb/pgregress for
+# the pgregress leg.
+
+FROM debian:trixie
+ARG PG_VERSION=19rc1
+ARG PGVECTOR_REF=v0.8.7
+ARG LT_UID=1000
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential bison flex pkg-config ca-certificates curl bzip2 git \
+        libreadline-dev zlib1g-dev libssl-dev libicu-dev libxml2-dev libxslt1-dev liblz4-dev \
+        libzstd-dev perl libipc-run-perl diffutils procps gdb locales \
+        python3 python3-venv python3-pip \
+    && sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen && locale-gen \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN url="https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" \
+ && curl -fsSL -o /tmp/pg.tar.bz2 "$url" \
+ && echo "$(curl -fsSL "$url.sha256" | awk '{print $1}')  /tmp/pg.tar.bz2" | sha256sum -c - \
+ && mkdir -p /usr/src/postgresql \
+ && tar -xjf /tmp/pg.tar.bz2 -C /usr/src/postgresql --strip-components=1 \
+ && rm /tmp/pg.tar.bz2 \
+ && cd /usr/src/postgresql \
+ && ./configure --prefix=/usr/local/pgsql --enable-cassert --enable-debug --enable-tap-tests \
+        --with-icu --with-lz4 --with-zstd --with-libxml --with-libxslt --with-openssl \
+        CFLAGS="-O2 -g" >/tmp/configure.log \
+ && make -s -j"$(nproc)" world-bin >/tmp/make.log 2>&1 \
+ && make -s install-world-bin >>/tmp/make.log 2>&1
+
+ENV PATH=/usr/local/pgsql/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/pgsql/lib \
+    TMPDIR=/tmp
+
+RUN git clone --depth 1 --branch "${PGVECTOR_REF}" https://github.com/pgvector/pgvector.git /tmp/pgvector \
+ && make -C /tmp/pgvector PG_CONFIG=pg_config OPTFLAGS="" -j8 \
+ && make -C /tmp/pgvector PG_CONFIG=pg_config install \
+ && rm -rf /tmp/pgvector
+
+RUN python3 -m venv /opt/pylance \
+ && /opt/pylance/bin/pip install --no-cache-dir pylance pyarrow numpy \
+ && /opt/pylance/bin/python -c "import lance, pyarrow; print('pylance', lance.__version__)"
+
+# PostgreSQL's regression suite of the same release, and its libraries
+RUN mkdir -p /cb/pgregress/src/test /cb/pgregress/contrib \
+ && cp -a /usr/src/postgresql/src/test/regress /cb/pgregress/src/test/ \
+ && cp -a /usr/src/postgresql/contrib/spi /cb/pgregress/contrib/ \
+ && inc="$(pg_config --includedir-server)" \
+ && for f in src/test/regress/regress.c contrib/spi/refint.c contrib/spi/autoinc.c; do \
+        gcc -O2 -fPIC -shared -I"$inc" -o "/cb/pgregress/src/test/regress/$(basename "$f" .c).so" "/cb/pgregress/$f" || exit 1; \
+    done
+
+# postgres, the host user's uid, owns the server's tree, into which the legs
+# install the extension and the vexec leg pg_vexec
+RUN set -eu; \
+    groupadd -o -g "$LT_UID" postgres; \
+    useradd -o -u "$LT_UID" -g postgres -m -d /home/postgres -s /bin/bash postgres; \
+    mkdir -p /var/run/postgresql; \
+    chown -R postgres:postgres /usr/local/pgsql /cb /var/run/postgresql
+
+ENV LANG=en_US.utf8
+USER postgres
+WORKDIR /home/postgres
+CMD ["bash"]

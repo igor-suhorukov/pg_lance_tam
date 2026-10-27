@@ -23,13 +23,13 @@ As of 2026-10-27, built and tested against:
 
 | | |
 |---|---|
-| PostgreSQL | 19rc1, PGDG's packages (`19~rc1-1.pgdg13+1`) in Docker Hub's `postgres:19rc1-trixie`, without assertions -- the build PostGIS's 19rc1 image runs |
+| PostgreSQL | 19rc1: PGDG's packages (`19~rc1-1.pgdg13+1`) in Docker Hub's `postgres:19rc1-trixie`, without assertions -- the build PostGIS's 19rc1 image runs -- and the same release built from source with assertions (`lance_tam/dev:19rc1-assert`) |
 | Lance | Rust crates `14.0.0-beta.19` (checkout at `dc53d5d`), linked from the checkout |
 | pgvector | 0.8.7 |
 | pylance | 14.0.0, for the interop leg |
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
-- Every leg of `test/run.sh` passes: `checks` (the ABI's two
+- Every leg of `test/run.sh` passes, on both builds: `checks` (the ABI's two
   declarations agree), `engine`, `suite` (12 files: basic, types, dml,
   search, indexes, datasets, schema, concurrency, encoding, pushdown,
   parallel, inplace), `recovery`, `s3` (LocalStack), `interop` (pylance),
@@ -41,8 +41,9 @@ As of 2026-10-27, built and tested against:
   orders), by what is refused (below) and the statements after it that
   depend on it, by row order and TIDs, and by the semantics stated under
   [Transactions](#transactions-and-concurrency) and [Limits](#limits).
-- On 19rc1 (its build has no assertions) all 239 files run with no crash
-  or PANIC; 117 differ, the one more a new check of `sqljson_queryfuncs`
+- On 19rc1, PGDG's build and the build with assertions alike, all 239
+  files run with no crash, failed assertion or PANIC, and the same 117
+  differ, the one more than on 19beta3 a new check of `sqljson_queryfuncs`
   that counts TOAST chunks, which lance tables have none of.  A check new
   to `foreign_key.sql` -- an equality function that updates the
   referenced row while the foreign key's check holds the unique index's
@@ -492,9 +493,12 @@ Each run's results go to `~/.cache/pg_vexec/lance_tam/runs/<time>-<leg>`.
 The dev image is Docker Hub's `postgres:19rc1-trixie` with PGXS at the
 server's own version; `LT_PG_TAG` names another tag of that image (a later
 19 release), `LT_UID` the uid the server runs as (the host user's, 1000).
+`LT_DEV_IMAGE=lance_tam/dev:19rc1-assert` runs a leg on PostgreSQL built
+from the same release with `--enable-cassert` (`docker/Dockerfile.assert`).
 
 ```
 test/run.sh images     # the engine builder and the dev image (postgres:19rc1-trixie, pgvector, pylance)
+test/run.sh assert-image  # the dev image with assertions: 19rc1 built from its source release
 test/run.sh fetch      # cargo fetch: the one step that reaches the network
 test/run.sh engine     # liblance_engine.so, into ~/.cache/pg_vexec/lance_tam/engine/lib
 test/run.sh checks     # the C ABI's two declarations agree
