@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# lance_tam's Compose project (docs/design.md §6): the images, and the
+# containers every leg runs in.  test/run.sh drives it; the host builds
+# images and starts containers, and nothing else.
+#
+#   lt-engine-builder  Dockerfile.engine: Rust on Debian trixie, for the
+#                      engine library
+#   engine             test/engine.sh build: the tree read-only at /src,
+#                      Lance's checkout read-only at /lance, the build tree
+#                      and cargo's caches at /build and /cargo, no network
+#   engine-fetch       test/engine.sh fetch: the same, with the network
+#   lt-dev-vanilla     Dockerfile.dev: Docker Hub's postgres image of
+#                      PostgreSQL 19 (LT_PG_TAG: 19rc1-trixie, PGDG's
+#                      packages on Debian trixie) with PGXS, pgvector,
+#                      pylance and PostgreSQL's regression suite; postgres
+#                      takes the host user's uid (LT_UID)
+#   vanilla            a leg's container on it: the tree read-only at /src,
+#                      its run's directory at /work, the engine library at
+#                      /engine, the pg_accel tree (for vexec) at /pg_accel,
+#                      and only the legs' own network, on which s3 serves
+#   s3                 an S3 API (LocalStack) for the legs that store
+#                      tables in a bucket
+
+name: lance_tam
+
+x-run: &run
+  user: postgres
+  shm_size: 2gb
+  mem_limit: ${LT_MEM:-40g}
+  memswap_limit: ${LT_MEM:-40g}
+  cpus: ${LT_CPUS:-0}
+  tmpfs:
+    - /tmp:exec
+  volumes:
+    - ..:/src:ro
+    - ${LT_WORK:-/nonexistent}:/work
+    - ${LT_ENGINE_BUILD:-${HOME}/.cache/pg_accel/lance_tam/engine}/lib:/engine:ro
+    - ${LT_PG_ACCEL:-${HOME}/dev/projects/oss_databases/github/pg_accel-vch}:/pg_accel:ro
+  environment:
+    LT_SRC: /src
+    LT_WORK: /work
+    MAKE_JOBS: ${MAKE_JOBS:-8}
+    LT_TESTS: ${LT_TESTS:-}
+    LT_SETTINGS: ${LT_SETTINGS:-}
+    LT_ENGINE: /engine/liblance_engine.so
+    LT_S3_ENDPOINT: http://s3:4566
+    LT_ENGINE_TRACE: ${LT_ENGINE_TRACE:-0}
+
+x-engine: &engine
+  image: lance_tam/engine-builder:rust1.99
+  user: "1000:1000"
+  mem_limit: ${LT_ENGINE_MEM:-44g}
+  memswap_limit: ${LT_ENGINE_MEM:-44g}
+  tmpfs:
+    - /tmp:exec
+  volumes:
+    - ..:/src:ro
+    - ${LT_LANCE_SRC:-${HOME}/dev/projects/oss_databases/github/lance}:/lance:ro
+    - ${LT_ENGINE_BUILD:-${HOME}/.cache/pg_accel/lance_tam/engine}:/build
+    - ${LT_CARGO_HOME:-${HOME}/.cache/pg_accel/lance_tam/cargo}:/cargo
+  environment:
+    LT_ENGINE_JOBS: ${LT_ENGINE_JOBS:-24}
+    LT_ENGINE_PROFILE: ${LT_ENGINE_PROFILE:-release}
+
+networks:
+  legs:
+    internal: true
+
+services:
+  lt-engine-builder:
+    image: lance_tam/engine-builder:rust1.99
+    build:
+      context: .
+      dockerfile: Dockerfile.engine
+    profiles: ["build"]
+
+  engine:
+    <<: *engine
+    network_mode: none
+    profiles: ["run"]
+
+  engine-fetch:
+    <<: *engine
+    profiles: ["run"]
+
+  lt-dev-vanilla:
+    image: lance_tam/dev:${LT_PG_TAG:-19rc1-trixie}
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        PG_IMAGE: postgres:${LT_PG_TAG:-19rc1-trixie}
+        LT_UID: ${LT_UID:-1000}
+    profiles: ["build"]
+
+  vanilla:
+    <<: *run
+    image: lance_tam/dev:${LT_PG_TAG:-19rc1-trixie}
+    networks: [legs]
+    profiles: ["run"]
+
+  s3:
+    image: localstack/localstack:4.9
+    networks:
+      legs:
+        aliases: [s3]
+    environment:
+      SERVICES: s3
+      EAGER_SERVICE_LOADING: "1"
+    profiles: ["run"]

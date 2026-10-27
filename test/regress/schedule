@@ -1,0 +1,11 @@
+test: basic
+test: types
+test: dml
+test: search
+test: indexes
+test: datasets
+test: schema
+test: concurrency
+test: encoding
+test: pushdown
+test: parallel

@@ -1,0 +1,96 @@
+-- Encodings: compression, compression_level and column_encoding as the
+-- "lance-encoding:" metadata of the dataset's fields (docs/design.md §2.5)
+CREATE TABLE enc_plain (id int, ids int[]) USING lance;
+SELECT f->>'name' AS name, f->>'format' AS format, f ? 'metadata' AS has_metadata,
+       f#>'{children,0}' ? 'metadata' AS item_has_metadata
+FROM jsonb_array_elements(lance.schema('enc_plain')) f;
+ name | format | has_metadata | item_has_metadata 
+------+--------+--------------+-------------------
+ id   | i      | f            | 
+ ids  | +l     | f            | f
+(2 rows)
+
+-- every column takes compression and compression_level, a column
+-- column_encoding names its own entries over them, the prefix optional
+CREATE TABLE enc (id int, ids int[], t smallint[], label text, emb vector(3))
+    USING lance WITH (compression = 'lz4', compression_level = 1,
+                      column_encoding = '{"ids": {"compression": "zstd", "compression-level": 3},
+                                          "t": {"lance-encoding:rle-threshold": "0.9", "bss": "off"}}');
+SELECT f->>'name' AS name, f->'metadata' AS metadata, f#>'{children,0,metadata}' AS item_metadata
+FROM jsonb_array_elements(lance.schema('enc')) f;
+ name  |                                                                      metadata                                                                      |                                                                   item_metadata                                                                    
+-------+----------------------------------------------------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------
+ id    | {"lance-encoding:compression": "lz4", "lance-encoding:compression-level": "1"}                                                                     | 
+ ids   | {"lance-encoding:compression": "zstd", "lance-encoding:compression-level": "3"}                                                                    | {"lance-encoding:compression": "zstd", "lance-encoding:compression-level": "3"}
+ t     | {"lance-encoding:bss": "off", "lance-encoding:compression": "lz4", "lance-encoding:rle-threshold": "0.9", "lance-encoding:compression-level": "1"} | {"lance-encoding:bss": "off", "lance-encoding:compression": "lz4", "lance-encoding:rle-threshold": "0.9", "lance-encoding:compression-level": "1"}
+ label | {"lance-encoding:compression": "lz4", "lance-encoding:compression-level": "1"}                                                                     | 
+ emb   | {"lance-encoding:compression": "lz4", "lance-encoding:compression-level": "1"}                                                                     | 
+(5 rows)
+
+-- what is written reads back
+INSERT INTO enc SELECT g, ARRAY[g, g + 1, g + 2], ARRAY[g % 7, g % 5]::smallint[], 'label ' || g,
+                       format('[%s,%s,%s]', g, g * 2, g * 3)::vector(3)
+FROM generate_series(1, 5000) g;
+SELECT count(*), sum(ids[3]), sum(t[1]), max(label), sum(emb[1]::float8) AS emb_first FROM
+    (SELECT id, ids, t, label, emb::real[] AS emb FROM enc) x;
+ count |   sum    |  sum  |    max    | emb_first 
+-------+----------+-------+-----------+-----------
+  5000 | 12512500 | 14997 | label 999 |  12502500
+(1 row)
+
+SELECT * FROM enc WHERE id = 4321;
+  id  |       ids        |   t   |   label    |        emb        
+------+------------------+-------+------------+-------------------
+ 4321 | {4321,4322,4323} | {2,1} | label 4321 | [4321,8642,12963]
+(1 row)
+
+VACUUM enc;
+SELECT count(*), sum(ids[1]) FROM enc;
+ count |   sum    
+-------+----------
+  5000 | 12502500
+(1 row)
+
+-- a column ALTER TABLE adds takes the table's encodings too
+ALTER TABLE enc ADD COLUMN extra int[];
+SELECT f->'metadata' AS metadata FROM jsonb_array_elements(lance.schema('enc')) f
+WHERE f->>'name' = 'extra';
+                                    metadata                                    
+--------------------------------------------------------------------------------
+ {"lance-encoding:compression": "lz4", "lance-encoding:compression-level": "1"}
+(1 row)
+
+UPDATE enc SET extra = ARRAY[id] WHERE id <= 10;
+SELECT count(extra), sum(extra[1]) FROM enc;
+ count | sum 
+-------+-----
+    10 |  55
+(1 row)
+
+-- refused
+CREATE TABLE enc_bad (id int) USING lance WITH (compression = 'gzip');
+ERROR:  option "compression": "gzip" is not a compression of Lance's
+HINT:  Lance compresses with lz4, zstd or fsst, or none.
+CREATE TABLE enc_bad (id int) USING lance WITH (compression_level = 'high');
+ERROR:  option "compression_level": a compression level must be an integer, not "high"
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = '[1]');
+ERROR:  column_encoding must be a JSON object of a column's name to an object of Lance's keys
+HINT:  For example: column_encoding = '{"ids": {"compression": "zstd"}}'.
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = '{"id": "lz4"}');
+ERROR:  column_encoding must be a JSON object of a column's name to an object of Lance's keys
+HINT:  For example: column_encoding = '{"ids": {"compression": "zstd"}}'.
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = '{"id": {"colour": "red"}}');
+ERROR:  "colour" is not a key of Lance's column encodings
+HINT:  The keys are compression, compression-level, rle-threshold, minichunk-size, dict-divisor, dict-size-ratio, dict-values-compression, dict-values-compression-level, packed, structural-encoding and bss.
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = '{"id": {"compression": null}}');
+ERROR:  column_encoding: the value of "compression" of column "id" must be a string, a number or a boolean
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = '{"id": {"compression": "brotli"}}');
+ERROR:  column_encoding: "brotli" is not a compression of Lance's
+HINT:  Lance compresses with lz4, zstd or fsst, or none.
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = '{"nope": {"compression": "lz4"}}');
+ERROR:  column_encoding names column "nope", which the table does not have
+CREATE TABLE enc_bad (id int) USING lance WITH (column_encoding = 'not json');
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "not" is invalid.
+CONTEXT:  JSON data, line 1: not...
+DROP TABLE enc, enc_plain;

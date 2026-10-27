@@ -1,0 +1,272 @@
+-- ALTER TABLE ... ADD COLUMN: a column of the dataset's, each row it has
+-- taking the default PostgreSQL gives the rows that predate the column, or
+-- NULL (docs/design.md §2.15)
+CREATE TABLE evo (id int NOT NULL, label varchar(10)) USING lance;
+INSERT INTO evo SELECT g, 'r' || g FROM generate_series(1, 2000) g;
+DELETE FROM evo WHERE id % 10 = 0;
+ALTER TABLE evo ADD COLUMN n int;
+ALTER TABLE evo ADD COLUMN d int DEFAULT 7, ADD COLUMN t text DEFAULT 'x',
+    ADD COLUMN v vector(3) DEFAULT '[1,2,3]';
+SELECT count(*), count(n), sum(d), min(t), max(t), count(v) FROM evo;
+ count | count |  sum  | min | max | count 
+-------+-------+-------+-----+-----+-------
+  1800 |     0 | 12600 | x   | x   |  1800
+(1 row)
+
+SELECT id, n, d, t, v FROM evo WHERE id = 1;
+ id | n | d | t |    v    
+----+---+---+---+---------
+  1 |   | 7 | x | [1,2,3]
+(1 row)
+
+INSERT INTO evo (id, label, n, d, t, v) VALUES (5000, 'new', 1, NULL, NULL, '[4,5,6]');
+UPDATE evo SET n = id WHERE id <= 3;
+SELECT id, label, n, d, t, v FROM evo WHERE id <= 3 OR id = 5000 ORDER BY id;
+  id  | label | n | d | t |    v    
+------+-------+---+---+---+---------
+    1 | r1    | 1 | 7 | x | [1,2,3]
+    2 | r2    | 2 | 7 | x | [1,2,3]
+    3 | r3    | 3 | 7 | x | [1,2,3]
+ 5000 | new   | 1 |   |   | [4,5,6]
+(4 rows)
+
+-- the new columns are Lance's: a filter on one is Lance's to apply
+EXPLAIN (COSTS OFF) SELECT id FROM evo WHERE d = 7 AND n = 2;
+               QUERY PLAN                
+-----------------------------------------
+ Custom Scan (LanceScan) on evo
+   Filter: ((d = 7) AND (n = 2))
+   Lance Columns: id, n, d
+   Lance Filter: (`d` = 7) AND (`n` = 2)
+(4 rows)
+
+SELECT id FROM evo WHERE d = 7 AND n = 2;
+ id 
+----
+  2
+(1 row)
+
+-- a vector column added is searched as any other
+SELECT id FROM evo ORDER BY v <-> '[4,5,6]' LIMIT 1;
+  id  
+------
+ 5000
+(1 row)
+
+-- constraints over a new column see the rows' value
+ALTER TABLE evo ADD COLUMN c int DEFAULT 5 CHECK (c < 3);
+ERROR:  check constraint "evo_c_check" of relation "evo" is violated by some row
+ALTER TABLE evo ADD COLUMN nn int NOT NULL;
+ERROR:  column "nn" of relation "evo" contains null values
+ALTER TABLE evo ADD COLUMN nd int NOT NULL DEFAULT 0;
+SELECT count(*), sum(nd) FROM evo;
+ count | sum 
+-------+-----
+  1801 |   0
+(1 row)
+
+-- a volatile default would rewrite the table
+ALTER TABLE evo ADD COLUMN r float8 DEFAULT random();
+ERROR:  lance tables cannot be rewritten
+DETAIL:  A rewrite would move the table's rows to a new dataset apart from the table's.
+HINT:  Plain VACUUM compacts a lance table's dataset.  ALTER TABLE keeps it for a new column's constant default and for a type change that converts no rows.
+-- a dropped column's name, given again: a column of its own
+ALTER TABLE evo DROP COLUMN n;
+ALTER TABLE evo ADD COLUMN n text DEFAULT 'again';
+SELECT id, n FROM evo WHERE id IN (1, 5000) ORDER BY id;
+  id  |   n   
+------+-------
+    1 | again
+ 5000 | again
+(2 rows)
+
+-- in a transaction: after its writes, which it commits first; and undone
+-- by its rollback
+BEGIN;
+INSERT INTO evo (id, label) VALUES (6000, 'tx');
+ALTER TABLE evo ADD COLUMN late int DEFAULT 1;
+INSERT INTO evo (id, label, late) VALUES (6001, 'tx2', 2);
+SELECT id, late FROM evo WHERE id >= 6000 ORDER BY id;
+  id  | late 
+------+------
+ 6000 |    1
+ 6001 |    2
+(2 rows)
+
+ROLLBACK;
+SELECT count(*) FROM evo WHERE id >= 6000;
+ count 
+-------
+     0
+(1 row)
+
+BEGIN;
+ALTER TABLE evo ADD COLUMN late int DEFAULT 1;
+INSERT INTO evo (id, label, late) VALUES (6001, 'tx2', 2);
+COMMIT;
+SELECT id, late FROM evo WHERE id IN (1, 6001) ORDER BY id;
+  id  | late 
+------+------
+    1 |    1
+ 6001 |    2
+(2 rows)
+
+-- a savepoint rolled back takes its column along
+BEGIN;
+SAVEPOINT s;
+ALTER TABLE evo ADD COLUMN gone int DEFAULT 3;
+ROLLBACK TO s;
+INSERT INTO evo (id, label) VALUES (7001, 'after');
+COMMIT;
+SELECT id, label, late FROM evo WHERE id = 7001;
+  id  | label | late 
+------+-------+------
+ 7001 | after |    1
+(1 row)
+
+-- ... and in one after the transaction's writes it is refused
+BEGIN;
+INSERT INTO evo (id, label) VALUES (7002, 'sp');
+SAVEPOINT s;
+ALTER TABLE evo ADD COLUMN sp int;
+ERROR:  cannot add a column to lance table "evo" in a subtransaction after changing its rows
+HINT:  Change the columns before the transaction's changes, or outside the savepoint.
+ROLLBACK;
+SELECT count(*) FROM evo WHERE id = 7002;
+ count 
+-------
+     0
+(1 row)
+
+-- the table's PostgreSQL indexes over the new columns, and VACUUM's
+-- compaction with them
+CREATE INDEX evo_d ON evo (d);
+VACUUM evo;
+SET enable_seqscan = off;
+SET lance.enable_customscan = off;
+SELECT count(*) FROM evo WHERE d = 7;
+ count 
+-------
+  1802
+(1 row)
+
+RESET enable_seqscan;
+RESET lance.enable_customscan;
+-- ALTER COLUMN ... TYPE: the changes PostgreSQL makes in its catalog alone,
+-- when the dataset's column keeps its Arrow type
+ALTER TABLE evo ALTER COLUMN label TYPE varchar(30);
+ALTER TABLE evo ALTER COLUMN label TYPE text;
+INSERT INTO evo (id, label) VALUES (8000, 'a label longer than ten');
+SELECT label FROM evo WHERE id = 8000;
+          label          
+-------------------------
+ a label longer than ten
+(1 row)
+
+ALTER TABLE evo ALTER COLUMN d TYPE bigint;
+ERROR:  cannot change the type of column "d" of lance table "evo" from integer to bigint
+DETAIL:  The dataset's column would hold values of another Arrow type.
+ALTER TABLE evo ALTER COLUMN t TYPE varchar(1);
+ERROR:  lance tables cannot be rewritten
+DETAIL:  A rewrite would move the table's rows to a new dataset apart from the table's.
+HINT:  Plain VACUUM compacts a lance table's dataset.  ALTER TABLE keeps it for a new column's constant default and for a type change that converts no rows.
+SELECT count(*) FROM evo;
+ count 
+-------
+  1804
+(1 row)
+
+DROP TABLE evo;
+-- DROP COLUMN drops the dataset's column too: a NOT NULL one needs no
+-- value after it, and its name is free again
+CREATE TABLE dropme (a int NOT NULL, b int NOT NULL, c text) USING lance;
+INSERT INTO dropme VALUES (1, 2, 'x');
+ALTER TABLE dropme DROP COLUMN b;
+INSERT INTO dropme VALUES (3, 'y');
+SELECT * FROM dropme ORDER BY a;
+ a | c 
+---+---
+ 1 | x
+ 3 | y
+(2 rows)
+
+ALTER TABLE dropme ADD COLUMN b text DEFAULT 'bee';
+SELECT * FROM dropme ORDER BY a;
+ a | c |  b  
+---+---+-----
+ 1 | x | bee
+ 3 | y | bee
+(2 rows)
+
+ALTER TABLE dropme DROP COLUMN a, DROP COLUMN c, DROP COLUMN b;
+ERROR:  cannot drop the last column of lance table "dropme"
+DETAIL:  A Lance dataset has at least one column.
+DROP TABLE dropme;
+-- NOT NULL is PostgreSQL's: dropped, the column takes NULLs
+CREATE TABLE nn (a int NOT NULL, b text) USING lance;
+INSERT INTO nn VALUES (1, 'x');
+INSERT INTO nn VALUES (NULL, 'y');
+ERROR:  null value in column "a" of relation "nn" violates not-null constraint
+DETAIL:  Failing row contains (null, y).
+ALTER TABLE nn ALTER COLUMN a DROP NOT NULL;
+INSERT INTO nn VALUES (NULL, 'y');
+SELECT a, b FROM nn ORDER BY b;
+ a | b 
+---+---
+ 1 | x
+   | y
+(2 rows)
+
+DROP TABLE nn;
+-- a virtual generated column is PostgreSQL's to compute: no column of the
+-- dataset's; a stored one is the dataset's
+CREATE TABLE gen (a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL NOT NULL,
+                  s int GENERATED ALWAYS AS (a + 1) STORED) USING lance;
+INSERT INTO gen (a) VALUES (1), (2);
+INSERT INTO gen (a) VALUES (NULL);
+ERROR:  null value in column "b" of relation "gen" violates not-null constraint
+DETAIL:  Failing row contains (null, virtual, null).
+ALTER TABLE gen ADD COLUMN c int GENERATED ALWAYS AS (a * 10) VIRTUAL;
+SELECT a, b, s, c FROM gen ORDER BY a;
+ a | b | s | c  
+---+---+---+----
+ 1 | 2 | 2 | 10
+ 2 | 4 | 3 | 20
+(2 rows)
+
+DROP TABLE gen;
+-- a materialized view cannot be lance's, even as the default: REFRESH
+-- rewrites it
+SET default_table_access_method = lance;
+CREATE MATERIALIZED VIEW mv AS SELECT 1 AS one;
+ERROR:  materialized views cannot use the lance access method
+HINT:  Create it USING heap.
+CREATE MATERIALIZED VIEW mv2 USING lance AS SELECT 1 AS one;
+ERROR:  materialized views cannot use the lance access method
+HINT:  Create it USING heap.
+CREATE MATERIALIZED VIEW mv USING heap AS SELECT 1 AS one;
+REFRESH MATERIALIZED VIEW mv;
+SELECT one FROM mv;
+ one 
+-----
+   1
+(1 row)
+
+DROP MATERIALIZED VIEW mv;
+RESET default_table_access_method;
+-- a table made in the transaction that adds to it
+BEGIN;
+CREATE TABLE fresh (a int) USING lance;
+INSERT INTO fresh VALUES (1), (2);
+ALTER TABLE fresh ADD COLUMN b text DEFAULT 'b';
+INSERT INTO fresh VALUES (3, 'c');
+COMMIT;
+SELECT * FROM fresh ORDER BY a;
+ a | b 
+---+---
+ 1 | b
+ 2 | b
+ 3 | c
+(3 rows)
+
+DROP TABLE fresh;

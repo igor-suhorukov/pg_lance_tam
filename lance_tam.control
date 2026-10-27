@@ -1,0 +1,8 @@
+# lance_tam: Lance datasets, local or on object storage, as PostgreSQL 19
+# tables (docs/design.md).
+comment = 'Lance datasets as tables: a table access method, vector search and Lance indexes'
+default_version = '0.1'
+module_pathname = '$libdir/lance_tam'
+relocatable = false
+schema = lance
+superuser = true

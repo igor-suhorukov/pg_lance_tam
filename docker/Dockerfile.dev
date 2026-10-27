@@ -1,0 +1,111 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# lance_tam's dev image (docs/design.md §6): Docker Hub's postgres image of
+# PostgreSQL 19, with what building the extension by PGXS and the legs need.
+# The extension is built into a copy of the tree in a leg's container and
+# every leg runs there.  Nothing is built or installed on the host; the tree
+# is bind-mounted read-only (test/run.sh).
+#
+#   PG_IMAGE=postgres:19rc1-trixie   the server: PostgreSQL 19rc1 as the
+#                                    PostgreSQL Global Development Group
+#                                    packages it for Debian trixie, built
+#                                    without assertions and with LLVM's JIT
+#                                    -- the build PostGIS's 19rc1 image runs;
+#                                    trixie is the engine builder's release,
+#                                    so that the engine library asks for no
+#                                    newer glibc than the server has
+#   LT_UID=1000                      postgres's uid and gid, the host user's,
+#                                    so that a leg's files in its run
+#                                    directory are the user's
+#
+# What the official image lacks, added here:
+#   postgresql-server-dev-19  PGXS and the server's headers, at the server's
+#                             own version (PG_VERSION): from PGDG's archive
+#                             once PGDG's repository has moved past it, so
+#                             that the build never compiles against headers
+#                             not the server's
+#   build-essential           the extension's build
+#   pgvector                  the vector types a table's vector columns are
+#                             declared with, built from its sources at
+#                             PGVECTOR_REF
+#   python3, pylance          Lance's Python package, which the interop leg
+#                             reads and writes the tables' datasets with,
+#                             beside the server
+#   libipc-run-perl           IPC::Run, for PostgreSQL's TAP modules
+#   gdb                       backtraces of a leg's crashed processes
+#   /cb/pgregress             PostgreSQL's own regression suite and the
+#                             libraries it loads (regress, and contrib/spi's
+#                             refint and autoinc), for the pgregress leg:
+#                             from the source release of the server's
+#                             version, checked against its SHA-256 as
+#                             ftp.postgresql.org gives it
+
+ARG PG_IMAGE=postgres:19rc1-trixie
+
+FROM ${PG_IMAGE}
+USER root
+ARG PGVECTOR_REF=v0.8.7
+ARG LT_UID=1000
+
+RUN set -eu; \
+    pkgs="postgresql-server-dev-$PG_MAJOR=$PG_VERSION build-essential git ca-certificates curl bzip2 \
+          perl libipc-run-perl diffutils procps gdb python3 python3-venv python3-pip"; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    if ! apt-get install -y --no-install-recommends $pkgs; then \
+        apt-get install -y --no-install-recommends ca-certificates; \
+        . /etc/os-release; \
+        echo "deb [ signed-by=/usr/local/share/keyrings/postgres.gpg.asc ] https://apt-archive.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg-archive main" \
+            >/etc/apt/sources.list.d/pgdg-archive.list; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends $pkgs; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
+# The server's own programs before Debian's wrappers
+ENV PATH=/usr/lib/postgresql/${PG_MAJOR}/bin:$PATH \
+    TMPDIR=/tmp
+
+RUN git clone --depth 1 --branch "${PGVECTOR_REF}" https://github.com/pgvector/pgvector.git /tmp/pgvector \
+ && make -C /tmp/pgvector PG_CONFIG=pg_config OPTFLAGS="" -j8 \
+ && make -C /tmp/pgvector PG_CONFIG=pg_config install \
+ && rm -rf /tmp/pgvector
+
+RUN python3 -m venv /opt/pylance \
+ && /opt/pylance/bin/pip install --no-cache-dir pylance pyarrow numpy \
+ && /opt/pylance/bin/python -c "import lance, pyarrow; print('pylance', lance.__version__)"
+
+RUN v="$(pg_config --version | awk '{print $2}')" \
+ && url="https://ftp.postgresql.org/pub/source/v$v/postgresql-$v.tar.bz2" \
+ && curl -fsSL -o /tmp/pg.tar.bz2 "$url" \
+ && echo "$(curl -fsSL "$url.sha256" | awk '{print $1}')  /tmp/pg.tar.bz2" | sha256sum -c - \
+ && mkdir -p /cb/pgregress \
+ && tar -xjf /tmp/pg.tar.bz2 -C /cb/pgregress --strip-components=1 \
+        "postgresql-$v/src/test/regress" "postgresql-$v/contrib/spi" \
+ && rm /tmp/pg.tar.bz2 \
+ && inc="$(pg_config --includedir-server)" \
+ && for f in src/test/regress/regress.c contrib/spi/refint.c contrib/spi/autoinc.c; do \
+        gcc -O2 -fPIC -shared -I"$inc" -o "/cb/pgregress/src/test/regress/$(basename "$f" .c).so" "/cb/pgregress/$f" || exit 1; \
+    done
+
+# postgres takes the host user's uid and gid, unless they are root's, which a
+# server does not run as; it owns the directories the extension and the
+# vexec leg's pg_vexec install into -- the modules, the scripts, and the
+# headers other extensions build against
+RUN set -eu; \
+    if [ "$LT_UID" != 0 ]; then \
+        groupmod -o -g "$LT_UID" postgres; \
+        usermod -o -u "$LT_UID" -g "$LT_UID" postgres; \
+    fi; \
+    mkdir -p "$(pg_config --includedir-server)/extension" /home/postgres; \
+    chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql /cb /home/postgres \
+        "$(pg_config --pkglibdir)" "$(pg_config --sharedir)/extension" \
+        "$(pg_config --includedir-server)/extension"
+
+# a leg's command, not the official image's entrypoint, which makes a
+# cluster of its own
+ENTRYPOINT []
+CMD ["bash"]
+USER postgres
+WORKDIR /home/postgres

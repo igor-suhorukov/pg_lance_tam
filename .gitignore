@@ -1,0 +1,14 @@
+# Design document (kept out of the repository)
+docs/design.md
+
+# IDE
+.idea/
+
+# Build outputs
+engine/target/
+*.o
+*.so
+*.bc
+results/
+regression.diffs
+regression.out

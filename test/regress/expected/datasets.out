@@ -1,0 +1,201 @@
+-- Datasets: where they live, attaching one that exists, versions,
+-- maintenance (docs/design.md §2.4, §2.10, §2.11)
+CREATE TABLE src (id int NOT NULL, label text, emb vector(2)) USING lance;
+INSERT INTO src VALUES (1, 'one', '[1,0]'), (2, 'two', '[0,1]');
+INSERT INTO src VALUES (3, 'three', '[1,1]');
+SELECT (lance.table_info('src')->>'managed')::bool AS managed,
+       lance.table_info('src')->>'uri' LIKE '%/lance_regress/public/src_%.lance' AS default_location;
+ managed | default_location 
+---------+------------------
+ t       | t
+(1 row)
+
+-- a second table over the same dataset, its columns taken from it
+SELECT format('CREATE TABLE att () USING lance WITH (uri = %L, read_only = true)',
+              lance.table_info('src')->>'uri') AS ddl \gset
+:ddl;
+\d att
+                 Table "public.att"
+ Column |   Type    | Collation | Nullable | Default 
+--------+-----------+-----------+----------+---------
+ id     | integer   |           |          | 
+ label  | text      |           |          | 
+ emb    | vector(2) |           |          | 
+
+SELECT * FROM att ORDER BY id;
+ id | label |  emb  
+----+-------+-------
+  1 | one   | [1,0]
+  2 | two   | [0,1]
+  3 | three | [1,1]
+(3 rows)
+
+INSERT INTO att VALUES (4, 'four', '[2,2]');
+ERROR:  lance table "att" is read-only
+DETAIL:  Its dataset has no stable row ids, or the table was attached with read_only.
+SELECT (lance.table_info('att')->>'managed')::bool AS managed;
+ managed 
+---------
+ f
+(1 row)
+
+-- it reads the version its catalog row names: src's later commits are not
+-- att's until it is refreshed ...
+INSERT INTO src VALUES (4, 'four', '[2,2]');
+SELECT count(*) FROM att;
+ count 
+-------
+     3
+(1 row)
+
+SELECT lance.refresh('att') > 0 AS refreshed;
+ refreshed 
+-----------
+ t
+(1 row)
+
+SELECT count(*) FROM att;
+ count 
+-------
+     4
+(1 row)
+
+-- ... unless it follows its dataset
+SELECT format('CREATE TABLE fol () USING lance WITH (uri = %L, read_only = true, follow = true)',
+              lance.table_info('src')->>'uri') AS ddl \gset
+:ddl;
+INSERT INTO src VALUES (5, 'five', '[3,3]');
+SELECT count(*) FROM fol;
+ count 
+-------
+     5
+(1 row)
+
+-- a table naming a column the dataset lacks is refused
+DO $$
+BEGIN
+  EXECUTE format('CREATE TABLE bad (nope int) USING lance WITH (uri = %L)',
+                 lance.table_info('src')->>'uri');
+EXCEPTION WHEN undefined_column THEN
+  RAISE NOTICE 'refused: %', regexp_replace(SQLERRM, ' at ".*"', '');
+END $$;
+NOTICE:  refused: column "nope" is not a column of the dataset
+-- dropping an attached table leaves the dataset
+DROP TABLE att, fol;
+SELECT count(*) FROM src;
+ count 
+-------
+     5
+(1 row)
+
+-- versions: each commit one, tagged with the transaction that made it
+SELECT count(*) >= 4 AS versions FROM lance.versions('src');
+ versions 
+----------
+ t
+(1 row)
+
+SELECT (lance.table_info('src')->>'version')::int = max(version) AS current FROM lance.versions('src');
+ current 
+---------
+ t
+(1 row)
+
+-- maintenance
+SELECT lance.optimize('src') ? 'fragments_removed' AS optimized;
+ optimized 
+-----------
+ t
+(1 row)
+
+SELECT (lance.table_info('src')->>'fragments')::int AS fragments;
+ fragments 
+-----------
+         1
+(1 row)
+
+SELECT count(*), string_agg(label, ',' ORDER BY id) FROM src;
+ count |       string_agg        
+-------+-------------------------
+     5 | one,two,three,four,five
+(1 row)
+
+SELECT lance.cleanup('src', '0 seconds') ? 'old_versions' AS cleaned;
+ cleaned 
+---------
+ t
+(1 row)
+
+SELECT count(*) FROM src;
+ count 
+-------
+     5
+(1 row)
+
+SELECT lance.explain('src', 'id > 1') ILIKE '%filter%' AS explained;
+ explained 
+-----------
+ t
+(1 row)
+
+-- options: credentials are refused, unknown storage options pass to Lance
+CREATE TABLE secret (a int) USING lance WITH (aws_secret_access_key = 'x');
+ERROR:  option "aws_secret_access_key" looks like a credential, which a lance table's options may not hold
+DETAIL:  A table's options are visible to every user.
+HINT:  Put credentials in a user mapping: CREATE SERVER ... FOREIGN DATA WRAPPER lance_storage, then CREATE USER MAPPING ... OPTIONS (...), and name the server with WITH (server = '...').
+-- ... and PostgreSQL's own storage parameters stay PostgreSQL's
+CREATE TABLE ns (a int) USING lance
+    WITH (autovacuum_enabled = false, parallel_workers = 2, toast.autovacuum_enabled = false,
+          max_rows_per_file = 100);
+SELECT reloptions FROM pg_class WHERE relname = 'ns';
+                  reloptions                   
+-----------------------------------------------
+ {autovacuum_enabled=false,parallel_workers=2}
+(1 row)
+
+ALTER TABLE ns SET (autovacuum_enabled = true);
+ALTER TABLE ns RESET (parallel_workers);
+SELECT reloptions FROM pg_class WHERE relname = 'ns';
+        reloptions         
+---------------------------
+ {autovacuum_enabled=true}
+(1 row)
+
+ALTER TABLE ns SET (max_rows_per_file = 5);
+ERROR:  option "max_rows_per_file" of a lance table cannot be changed by ALTER TABLE
+DETAIL:  A lance table's own options are set when the table is created.
+CREATE TABLE badparam (a int) USING lance WITH (autovacuum_enabled = 'maybe');
+ERROR:  invalid value for boolean option "autovacuum_enabled": maybe
+DROP TABLE ns;
+-- ALTER TABLE that would leave the dataset behind is refused
+ALTER TABLE src SET UNLOGGED;
+ERROR:  this ALTER TABLE is not supported on lance tables
+DETAIL:  It would change the table's columns or rewrite it apart from its Lance dataset.
+ALTER TABLE src ALTER COLUMN id TYPE bigint;
+ERROR:  cannot change the type of column "id" of lance table "src" from integer to bigint
+DETAIL:  The dataset's column would hold values of another Arrow type.
+ALTER TABLE src SET ACCESS METHOD heap;
+ERROR:  cannot change the access method of a table to or from lance
+HINT:  Create a new table and copy the rows: CREATE TABLE ... USING lance; INSERT INTO ... SELECT ...
+VACUUM FULL src;
+ERROR:  lance tables cannot be rewritten
+DETAIL:  A rewrite would move the table's rows to a new dataset apart from the table's.
+HINT:  Plain VACUUM compacts a lance table's dataset.  ALTER TABLE keeps it for a new column's constant default and for a type change that converts no rows.
+CLUSTER src USING nothing;
+ERROR:  index "nothing" for table "src" does not exist
+-- ... a rename, a comment, a default are the catalog's alone
+ALTER TABLE src RENAME COLUMN label TO title;
+SELECT title FROM src WHERE id = 1;
+ title 
+-------
+ one
+(1 row)
+
+ALTER TABLE src RENAME TO src2;
+SELECT count(*) FROM src2;
+ count 
+-------
+     5
+(1 row)
+
+DROP TABLE src2;

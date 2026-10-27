@@ -1,0 +1,4 @@
+# Lance's own baseline (its .cargo/config.toml): haswell, with explicit SIMD
+# and runtime dispatch above it in Lance's kernels.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2,+fma,+f16c"]

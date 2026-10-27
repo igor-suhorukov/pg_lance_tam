@@ -1,0 +1,152 @@
+-- Parallel LanceScan (docs/design.md §2.8): its participants take the
+-- version's fragments one at a time, each a reader of the scan's columns
+-- and filter; the rows are the serial scan's
+-- fragments of 1,000 rows, which no autovacuum compacts while the test runs
+CREATE TABLE pt (id int, x int, t text) USING lance
+  WITH (max_rows_per_file = 1000, autovacuum_enabled = false);
+INSERT INTO pt SELECT g, (g * 7919) % 10007, 'r' || g FROM generate_series(1, 20000) g;
+ANALYZE pt;
+SELECT (lance.table_info('pt')->>'fragments')::int > 10 AS many_fragments;
+ many_fragments 
+----------------
+ t
+(1 row)
+
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x) FROM pt;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (LanceScan) on pt
+                     Lance Columns: x
+(6 rows)
+
+SELECT count(*), sum(x) FROM pt;
+ count |    sum    
+-------+-----------
+ 20000 | 100070125
+(1 row)
+
+-- Lance's filter in each participant
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM pt WHERE x < 500;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (LanceScan) on pt
+                     Filter: (x < 500)
+                     Lance Columns: id, x
+                     Lance Filter: (`x` < 500)
+(8 rows)
+
+SELECT count(*), sum(id) FROM pt WHERE x < 500;
+ count |   sum   
+-------+---------
+   998 | 9988501
+(1 row)
+
+-- a generic plan's parameter, given to the workers
+PREPARE pq(int) AS SELECT count(*), sum(id) FROM pt WHERE x < $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE pq(500);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Custom Scan (LanceScan) on pt
+                     Filter: (x < $1)
+                     Lance Columns: id, x
+                     Lance Filter: (`x` < $1)
+(8 rows)
+
+EXECUTE pq(500);
+ count |   sum   
+-------+---------
+   998 | 9988501
+(1 row)
+
+EXECUTE pq(NULL);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+RESET plan_cache_mode;
+-- rows through Gather, in order
+SELECT id, x FROM pt WHERE x < 4 ORDER BY x, id;
+  id   | x 
+-------+---
+ 10007 | 0
+  8967 | 1
+ 18974 | 1
+  7927 | 2
+ 17934 | 2
+  6887 | 3
+ 16894 | 3
+(7 rows)
+
+-- the leader alone, every fragment its own
+SET parallel_leader_participation = off;
+SELECT count(*), sum(x) FROM pt;
+ count |    sum    
+-------+-----------
+ 20000 | 100070125
+(1 row)
+
+RESET parallel_leader_participation;
+-- the serial scan agrees
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x) FROM pt;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on pt
+         Lance Columns: x
+(3 rows)
+
+SELECT count(*), sum(x) FROM pt;
+ count |    sum    
+-------+-----------
+ 20000 | 100070125
+(1 row)
+
+SELECT count(*), sum(id) FROM pt WHERE x < 500;
+ count |   sum   
+-------+---------
+   998 | 9988501
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+-- a transaction that wrote the table scans it alone: its rows are its own
+BEGIN;
+INSERT INTO pt VALUES (0, 0, 'own');
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x) FROM pt;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on pt
+         Lance Columns: x
+(3 rows)
+
+SELECT count(*), sum(x) FROM pt;
+ count |    sum    
+-------+-----------
+ 20001 | 100070125
+(1 row)
+
+ROLLBACK;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+DROP TABLE pt;

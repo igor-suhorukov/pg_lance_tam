@@ -1,0 +1,37 @@
+== PostgreSQL wrote 90 rows
+python rows: 90
+python first: [{'id': 1, 'name': 'pg 1', 'emb': [0.0, 1.0, 0.0]}, {'id': 2, 'name': 'pg 2', 'emb': [0.0, 0.0, 1.0]}]
+python nearest: [3, 6]
+== Python appends: PostgreSQL sees the rows after lance.refresh()
+python appended; rows now: 92
+pg rows before refresh: 90
+t
+pg rows after refresh: 92
+pg rows from python: 1001,1002
+pg nearest to [9,9,9]: 1002
+== PostgreSQL writes on top of Python's commit
+python rows: 93
+pg rows: 93
+== a Python index, used by PostgreSQL's filter
+python indices: ['id_idx']
+t
+pg indices: id_idx
+pg by id: updated by pg
+== a column PostgreSQL adds, Python reads
+python columns: ['id', 'name', 'emb', 'tag']
+python tags: [{'id': 1, 'tag': 'old'}, {'id': 3000, 'tag': 'new'}]
+== a dataset Python made, attached
+python wrote WORK/py_made.lance
+--------+------------------+-----------+----------+---------
+ k      | integer          |           |          | 
+ tag    | text             |           |          | 
+ score  | double precision |           |          | 
+pg reads: 1:a:0.5 2:b:1.5 3:-:2.5
+pg after writes: 1:0.5 2:15 3:2.5 4:4.5
+python rows: 4
+== a dataset without stable row ids: read-only
+python wrote WORK/py_plain.lance
+NOTICE:  the dataset at "WORK/py_plain.lance" has no stable row ids: the table is read-only
+pg reads: 15
+ERROR:  lance table "pyp" is read-only
+python still has it: python rows: 4

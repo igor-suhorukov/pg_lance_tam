@@ -1,0 +1,221 @@
+-- PostgreSQL's own indexes over a lance table: their entries are the rows'
+-- TIDs, which are the rows' stable row ids (docs/design.md §2.6)
+CREATE TABLE people (id int NOT NULL, name text, age int) USING lance;
+INSERT INTO people SELECT g, 'p' || g, g % 90 FROM generate_series(1, 5000) g;
+CREATE INDEX people_age ON people (age);
+CREATE UNIQUE INDEX people_id ON people (id);
+ANALYZE people;
+SET enable_seqscan = off;
+SET lance.enable_customscan = off;
+EXPLAIN (COSTS OFF) SELECT name FROM people WHERE id = 4321;
+              QUERY PLAN              
+--------------------------------------
+ Index Scan using people_id on people
+   Index Cond: (id = 4321)
+(2 rows)
+
+SELECT name FROM people WHERE id = 4321;
+ name  
+-------
+ p4321
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM people WHERE age = 33;
+                 QUERY PLAN                  
+---------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on people
+         Recheck Cond: (age = 33)
+         ->  Bitmap Index Scan on people_age
+               Index Cond: (age = 33)
+(5 rows)
+
+SELECT count(*) FROM people WHERE age = 33;
+ count 
+-------
+    56
+(1 row)
+
+SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM people WHERE age BETWEEN 10 AND 12;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on people
+         Recheck Cond: ((age >= 10) AND (age <= 12))
+         ->  Bitmap Index Scan on people_age
+               Index Cond: ((age >= 10) AND (age <= 12))
+(5 rows)
+
+SELECT count(*) FROM people WHERE age BETWEEN 10 AND 12;
+ count 
+-------
+   168
+(1 row)
+
+RESET enable_indexscan;
+-- writes keep the indexes; a deleted row's entry finds nothing
+UPDATE people SET age = 200 WHERE id = 10;
+SELECT id, age FROM people WHERE age = 200;
+ id | age 
+----+-----
+ 10 | 200
+(1 row)
+
+DELETE FROM people WHERE id = 11;
+SELECT count(*) FROM people WHERE id = 11;
+ count 
+-------
+     0
+(1 row)
+
+INSERT INTO people VALUES (6000, 'late', 201);
+SELECT id FROM people WHERE age = 201;
+  id  
+------
+ 6000
+(1 row)
+
+-- the unique index refuses a duplicate, in a statement and across them
+INSERT INTO people VALUES (6000, 'dup', 1);
+ERROR:  duplicate key value violates unique constraint "people_id"
+DETAIL:  Key (id)=(6000) already exists.
+INSERT INTO people VALUES (7000, 'a', 1), (7000, 'b', 1);
+ERROR:  duplicate key value violates unique constraint "people_id"
+DETAIL:  Key (id)=(7000) already exists.
+BEGIN;
+INSERT INTO people VALUES (8000, 'x', 1);
+INSERT INTO people VALUES (8000, 'y', 1);
+ERROR:  duplicate key value violates unique constraint "people_id"
+DETAIL:  Key (id)=(8000) already exists.
+ROLLBACK;
+SELECT count(*) FROM people WHERE id IN (7000, 8000);
+ count 
+-------
+     0
+(1 row)
+
+-- ON CONFLICT, through the unique index
+INSERT INTO people VALUES (6000, 'conflict', 1) ON CONFLICT (id) DO NOTHING;
+INSERT INTO people VALUES (6000, 'upserted', 5) ON CONFLICT (id) DO UPDATE SET name = excluded.name;
+SELECT id, name, age FROM people WHERE id = 6000;
+  id  |   name   | age 
+------+----------+-----
+ 6000 | upserted | 201
+(1 row)
+
+-- ... and a command that would change a row it inserted itself
+INSERT INTO people VALUES (9000, 'a', 1), (9000, 'b', 2) ON CONFLICT (id) DO UPDATE SET name = excluded.name;
+ERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time
+HINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.
+RESET enable_seqscan;
+RESET lance.enable_customscan;
+-- CREATE INDEX CONCURRENTLY and REINDEX CONCURRENTLY: the index built in
+-- one transaction and validated against the table in another
+CREATE INDEX CONCURRENTLY people_name ON people (name);
+SELECT indisvalid FROM pg_index WHERE indexrelid = 'people_name'::regclass;
+ indisvalid 
+------------
+ t
+(1 row)
+
+REINDEX INDEX CONCURRENTLY people_name;
+SET enable_seqscan = off;
+SET lance.enable_customscan = off;
+SELECT id FROM people WHERE name = 'p77';
+ id 
+----
+ 77
+(1 row)
+
+RESET enable_seqscan;
+RESET lance.enable_customscan;
+DROP INDEX CONCURRENTLY people_name;
+CREATE INDEX CONCURRENTLY people_lance ON people USING lance_index (age);
+ERROR:  a lance_index cannot be built concurrently
+-- VACUUM compacts the dataset; the row ids, and so the indexes, stay
+SELECT (lance.table_info('people')->>'fragments')::int > 1 AS many_fragments;
+ many_fragments 
+----------------
+ t
+(1 row)
+
+VACUUM people;
+SELECT (lance.table_info('people')->>'fragments')::int AS fragments;
+ fragments 
+-----------
+         1
+(1 row)
+
+SET enable_seqscan = off;
+SET lance.enable_customscan = off;
+SELECT name FROM people WHERE id = 4321;
+ name  
+-------
+ p4321
+(1 row)
+
+SELECT id, name FROM people WHERE id = 6000;
+  id  |   name   
+------+----------
+ 6000 | upserted
+(1 row)
+
+RESET enable_seqscan;
+RESET lance.enable_customscan;
+REINDEX TABLE people;
+SELECT count(*) FROM people;
+ count 
+-------
+  5000
+(1 row)
+
+-- foreign keys, both ways, between lance tables and heap
+CREATE TABLE teams (id int PRIMARY KEY, name text) USING lance;
+CREATE TABLE members (id int, team int REFERENCES teams (id) ON DELETE CASCADE, name text) USING lance;
+INSERT INTO teams VALUES (1, 'one'), (2, 'two');
+INSERT INTO members VALUES (10, 1, 'x'), (11, 2, 'y');
+INSERT INTO members VALUES (12, 3, 'z');
+ERROR:  insert or update on table "members" violates foreign key constraint "members_team_fkey"
+DETAIL:  Key (team)=(3) is not present in table "teams".
+BEGIN;
+INSERT INTO teams VALUES (3, 'three');
+INSERT INTO members VALUES (12, 3, 'z');
+UPDATE members SET team = 1 WHERE id = 12;
+COMMIT;
+DELETE FROM teams WHERE id = 2;
+SELECT id, team FROM members ORDER BY id;
+ id | team 
+----+------
+ 10 |    1
+ 12 |    1
+(2 rows)
+
+UPDATE teams SET id = 5 WHERE id = 1;
+ERROR:  update or delete on table "teams" violates foreign key constraint "members_team_fkey" on table "members"
+DETAIL:  Key (id)=(1) is still referenced from table "members".
+CREATE TABLE heap_ref (team int REFERENCES teams (id));
+INSERT INTO heap_ref VALUES (1);
+INSERT INTO heap_ref VALUES (4);
+ERROR:  insert or update on table "heap_ref" violates foreign key constraint "heap_ref_team_fkey"
+DETAIL:  Key (team)=(4) is not present in table "teams".
+DROP TABLE heap_ref, members, teams;
+-- MERGE
+CREATE TABLE stock (item int PRIMARY KEY, qty int) USING lance;
+INSERT INTO stock VALUES (1, 10), (2, 20), (3, 30);
+CREATE TEMP TABLE delivery (item int, qty int);
+INSERT INTO delivery VALUES (1, 5), (3, -30), (4, 7);
+MERGE INTO stock s USING delivery d ON s.item = d.item
+WHEN MATCHED AND s.qty + d.qty <= 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET qty = s.qty + d.qty
+WHEN NOT MATCHED THEN INSERT VALUES (d.item, d.qty);
+SELECT * FROM stock ORDER BY item;
+ item | qty 
+------+-----
+    1 |  15
+    2 |  20
+    4 |   7
+(3 rows)
+
+DROP TABLE stock;
+DROP TABLE people;
