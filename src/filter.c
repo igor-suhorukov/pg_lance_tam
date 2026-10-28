@@ -9,7 +9,10 @@
  *	  column with a constant on integer, boolean, date and text types (text
  *	  ranges under the C collation alone, equality under any deterministic
  *	  one, as byte equality is equality there), IN lists of those, IS
- *	  [NOT] NULL, and AND, OR and NOT of them.  Floating-point comparisons
+ *	  [NOT] NULL; of an array of those types, a list column, @> and && with
+ *	  an array of its elements' type and = ANY of an element, Lance's
+ *	  array_has_all, array_has_any and array_has, which a LABEL_LIST index
+ *	  answers; and AND, OR and NOT of them.  Floating-point comparisons
  *	  stay PostgreSQL's: -0 and NaN compare otherwise in Arrow.  Every qual
  *	  is evaluated again by the executor, so a predicate given only narrows
  *	  what is read.
@@ -68,9 +71,24 @@ typedef struct FilterContext
 								 * undecided, not false */
 	bool		negated;		/* a NOT above the node */
 	Bitmapset  *attnums;
+	Bitmapset  *list_attnums;	/* the list columns compared by elements */
 	bool		sargable;
 	int			nsearch;
 } FilterContext;
+
+/*
+ * A value the scan is given, in the predicate (lt_filter_value_append()): a
+ * literal of the column or of a list column's elements, or an array's
+ * elements as an IN list's or as a list's
+ */
+typedef enum ValueForm
+{
+	VALUE_LITERAL,
+	VALUE_ELEMENT,				/* array_has's */
+	VALUE_IN_LIST,				/* = ANY's: its NULLs left out */
+	VALUE_HAS_ALL,				/* @>'s: none NULL */
+	VALUE_HAS_ANY				/* &&'s: its NULLs left out */
+} ValueForm;
 
 /* A column, quoted as Lance's filters quote one: in backticks */
 static void
@@ -149,6 +167,33 @@ var_column(FilterContext *cxt, Node *node, Oid *typid, Oid *collid)
 	*collid = var->varcollid;
 	cxt->attnums = bms_add_member(cxt->attnums, var->varattno);
 	return cxt->table->columns[var->varattno - 1];
+}
+
+/*
+ * The Lance column of a Var of an array of a class's type -- a list
+ * (convert.c) -- that a qual compares by its elements, their class and base
+ * type; or NULL
+ */
+static const char *
+list_column(FilterContext *cxt, Node *node, ColClass *cls, Oid *elemtype)
+{
+	Oid			typid;
+	Oid			collid;
+	const char *column = var_column(cxt, node, &typid, &collid);
+
+	if (column == NULL)
+		return NULL;
+	*elemtype = get_element_type(typid);
+	if (!OidIsValid(*elemtype))
+		return NULL;
+	*elemtype = getBaseType(*elemtype);
+	*cls = type_class(*elemtype);
+	if (*cls == COL_NONE)
+		return NULL;
+	if (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+	cxt->list_attnums = bms_add_member(cxt->list_attnums, ((Var *) node)->varattno);
+	return column;
 }
 
 /* Whether a constant of the type is a literal of a column of the class */
@@ -245,15 +290,71 @@ append_const(StringInfo buf, ColClass cls, Oid coltype, Oid typid, Datum value)
 }
 
 /*
+ * A constant as a literal of a list column's elements: an integer cast to
+ * their width, coltype, as Lance takes a bare one as a bigint and would
+ * cast the column to a list of bigints for it, past its LABEL_LIST index.
+ */
+static bool
+append_element(StringInfo buf, ColClass cls, Oid coltype, Oid typid, Datum value)
+{
+	const char *width = NULL;
+
+	if (cls == COL_INT && coltype != INT8OID)
+		width = coltype == INT2OID ? "SMALLINT" : "INT";
+	if (width)
+		appendStringInfoString(buf, "CAST(");
+	if (!append_const(buf, cls, coltype, typid, value))
+		return false;
+	if (width)
+		appendStringInfo(buf, " AS %s)", width);
+	return true;
+}
+
+/*
+ * An array's elements but its NULLs, comma-separated, as literals of the
+ * column's class -- of a list column's elements when of_list -- or false;
+ * *n gets the array's elements, *k those appended.
+ */
+static bool
+append_elements(StringInfo buf, ColClass cls, Oid coltype, Datum array, bool of_list,
+				int *n, int *k)
+{
+	ArrayType  *a = DatumGetArrayTypeP(array);
+	Oid			elemtype = getBaseType(ARR_ELEMTYPE(a));
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+
+	get_typlenbyvalalign(ARR_ELEMTYPE(a), &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(a, ARR_ELEMTYPE(a), elmlen, elmbyval, elmalign, &elems, &nulls, n);
+	*k = 0;
+	if (*n > MAX_IN_LIST)
+		return false;
+	for (int i = 0; i < *n; i++)
+	{
+		if (nulls[i])
+			continue;
+		if ((*k)++ > 0)
+			appendStringInfoString(buf, ", ");
+		if (!(of_list ? append_element(buf, cls, coltype, elemtype, elems[i]) :
+			  append_const(buf, cls, coltype, elemtype, elems[i])))
+			return false;
+	}
+	return true;
+}
+
+/*
  * A value a LanceScan qual compares a column with that the scan is given
  * when it starts -- an expression of parameters, of the Vars of the
  * relations the scan is parameterized by and of stable functions, never of
- * the scanned relation's -- in the predicate as its number.  An array's are
- * the values of an IN list.
+ * the scanned relation's -- in the predicate as its number.  An array's
+ * elements are those of an IN list or of a list, as form says.
  */
 static bool
 append_value(FilterContext *cxt, StringInfo buf, Node *value, ColClass cls, Oid coltype,
-			 bool array)
+			 ValueForm form)
 {
 	Relids		varnos;
 	Oid			valtype;
@@ -264,7 +365,7 @@ append_value(FilterContext *cxt, StringInfo buf, Node *value, ColClass cls, Oid 
 	if (bms_is_member(cxt->varno, varnos) || !bms_is_subset(varnos, cxt->outer_relids))
 		return false;
 	valtype = getBaseType(exprType(value));
-	if (array)
+	if (form >= VALUE_IN_LIST)
 	{
 		valtype = get_element_type(valtype);
 		if (!OidIsValid(valtype))
@@ -278,7 +379,7 @@ append_value(FilterContext *cxt, StringInfo buf, Node *value, ColClass cls, Oid 
 	cxt->pieces = lappend(cxt->pieces, makeInteger(cxt->next_value++));
 	cxt->values = lappend(cxt->values, value);
 	cxt->value_info = lappend(cxt->value_info,
-							  lappend_int(list_make5_int(cls, coltype, valtype, array,
+							  lappend_int(list_make5_int(cls, coltype, valtype, form,
 														 cxt->or_depth == 0),
 										  !cxt->negated));
 	return true;
@@ -401,12 +502,115 @@ deparse_opexpr(FilterContext *cxt, OpExpr *op, StringInfo buf)
 		if (!append_const(buf, cls, typid, getBaseType(c->consttype), c->constvalue))
 			return false;
 	}
-	else if (!append_value(cxt, buf, right, cls, typid, false))
+	else if (!append_value(cxt, buf, right, cls, typid, VALUE_LITERAL))
 		return false;
 	appendStringInfoChar(buf, ')');
 	/* <> is the index's equality negated: most rows, read through it */
 	if (strcmp(sym, "<>") == 0)
 		cxt->sargable = false;
+	cxt->nsearch++;
+	return true;
+}
+
+/*
+ * col @> array as array_has_all(col, [...]), array <@ col as it too, and
+ * col && array as array_has_any(col, [...]): col a list column, the array
+ * a constant or a value of its elements' type, the elements compared by
+ * their type's equality.  PostgreSQL's matches no NULL element where
+ * Lance's matches NULL with NULL, so the list has none: an array with a
+ * NULL is left PostgreSQL's for @>, and taken without its NULLs for &&;
+ * nor is an empty one given, of which Lance's is no NULL for a NULL list.
+ */
+static bool
+deparse_array_op(FilterContext *cxt, OpExpr *op, StringInfo buf)
+{
+	bool		all = op->opno != OID_ARRAY_OVERLAP_OP;
+	Node	   *col;
+	Node	   *arr;
+	const char *column;
+	ColClass	cls;
+	Oid			elemtype;
+	int			n;
+	int			k;
+
+	if (list_length(op->args) != 2)
+		return false;
+	col = linitial(op->args);
+	arr = lsecond(op->args);
+	if (op->opno == OID_ARRAY_CONTAINED_OP)
+	{
+		col = lsecond(op->args);
+		arr = linitial(op->args);
+	}
+	column = list_column(cxt, col, &cls, &elemtype);
+	if (column == NULL && op->opno == OID_ARRAY_OVERLAP_OP)
+	{
+		/* && commutes */
+		arr = col;
+		column = list_column(cxt, lsecond(op->args), &cls, &elemtype);
+	}
+	if (column == NULL || (cls == COL_TEXT && !text_op_ok(op->inputcollid, true)))
+		return false;
+	if (arr && IsA(arr, RelabelType))
+		arr = (Node *) ((RelabelType *) arr)->arg;
+	if (arr == NULL || (IsA(arr, Const) && ((Const *) arr)->constisnull))
+		return false;
+	appendStringInfo(buf, "array_has_%s(", all ? "all" : "any");
+	append_ident(buf, column);
+	appendStringInfoString(buf, ", [");
+	if (IsA(arr, Const))
+	{
+		if (!append_elements(buf, cls, elemtype, ((Const *) arr)->constvalue, true, &n, &k) ||
+			k == 0 || (all && k < n))
+			return false;
+		cxt->nsearch += k;
+	}
+	else
+	{
+		if (!append_value(cxt, buf, arr, cls, elemtype, all ? VALUE_HAS_ALL : VALUE_HAS_ANY))
+			return false;
+		cxt->nsearch += cxt->root ?
+			(int) Min(estimate_array_length(cxt->root, arr), MAX_IN_LIST) : 10;
+	}
+	appendStringInfoString(buf, "])");
+	return true;
+}
+
+/*
+ * value = ANY (col) as array_has(col, value): deparse_in_list()'s = ANY
+ * with a list column the array.  Lance's is false where PostgreSQL's is
+ * NULL -- no element equal, one NULL -- which a NOT makes true: not given
+ * under one.
+ */
+static bool
+deparse_array_has(FilterContext *cxt, ScalarArrayOpExpr *saop, StringInfo buf)
+{
+	Node	   *value = linitial(saop->args);
+	const char *column;
+	ColClass	cls;
+	Oid			elemtype;
+
+	if (cxt->negated)
+		return false;
+	column = list_column(cxt, lsecond(saop->args), &cls, &elemtype);
+	if (column == NULL || (cls == COL_TEXT && !text_op_ok(saop->inputcollid, true)))
+		return false;
+	if (value && IsA(value, RelabelType))
+		value = (Node *) ((RelabelType *) value)->arg;
+	if (value == NULL || (IsA(value, Const) && ((Const *) value)->constisnull))
+		return false;
+	appendStringInfoString(buf, "array_has(");
+	append_ident(buf, column);
+	appendStringInfoString(buf, ", ");
+	if (IsA(value, Const))
+	{
+		if (!append_element(buf, cls, elemtype, getBaseType(((Const *) value)->consttype),
+							((Const *) value)->constvalue))
+			return false;
+	}
+	else if (!append_value(cxt, buf, value, cls, elemtype, VALUE_ELEMENT))
+		return false;
+	appendStringInfoChar(buf, ')');
 	cxt->nsearch++;
 	return true;
 }
@@ -418,20 +622,12 @@ deparse_in_list(FilterContext *cxt, ScalarArrayOpExpr *saop, StringInfo buf)
 	Oid			typid;
 	Oid			collid;
 	Node	   *arr;
-	Const	   *c;
-	ArrayType  *a;
-	Oid			elemtype;
-	int16		elmlen;
-	bool		elmbyval;
-	char		elmalign;
-	Datum	   *elems;
-	bool	   *nulls;
 	int			n;
+	int			k;
 	bool		is_equality;
 	bool		commuted_ok;
 	const char *sym;
 	ColClass	cls;
-	int			k = 0;
 
 	if (!saop->useOr || list_length(saop->args) != 2 || !builtin_comparison(saop->opno))
 		return false;
@@ -440,46 +636,27 @@ deparse_in_list(FilterContext *cxt, ScalarArrayOpExpr *saop, StringInfo buf)
 		return false;
 	column = var_column(cxt, linitial(saop->args), &typid, &collid);
 	if (column == NULL)
-		return false;
+		return deparse_array_has(cxt, saop, buf);
 	cls = type_class(typid);
 	if (cls == COL_NONE || (cls == COL_TEXT && !text_op_ok(saop->inputcollid, true)))
 		return false;
 	arr = lsecond(saop->args);
+	appendStringInfoChar(buf, '(');
+	append_ident(buf, column);
+	appendStringInfoString(buf, " IN (");
 	if (!IsA(arr, Const))
 	{
-		appendStringInfoChar(buf, '(');
-		append_ident(buf, column);
-		appendStringInfoString(buf, " IN (");
-		if (!append_value(cxt, buf, arr, cls, typid, true))
+		if (!append_value(cxt, buf, arr, cls, typid, VALUE_IN_LIST))
 			return false;
 		appendStringInfoString(buf, "))");
 		cxt->nsearch += cxt->root ?
 			(int) Min(estimate_array_length(cxt->root, arr), MAX_IN_LIST) : 10;
 		return true;
 	}
-	if (((Const *) arr)->constisnull)
-		return false;
-	c = (Const *) arr;
-	a = DatumGetArrayTypeP(c->constvalue);
-	elemtype = ARR_ELEMTYPE(a);
-	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
-	deconstruct_array(a, elemtype, elmlen, elmbyval, elmalign, &elems, &nulls, &n);
-	if (n == 0 || n > MAX_IN_LIST)
-		return false;
-	appendStringInfoChar(buf, '(');
-	append_ident(buf, column);
-	appendStringInfoString(buf, " IN (");
-	for (int i = 0; i < n; i++)
-	{
-		if (nulls[i])
-			continue;
-		if (k++ > 0)
-			appendStringInfoString(buf, ", ");
-		if (!append_const(buf, cls, typid, getBaseType(elemtype), elems[i]))
-			return false;
-	}
-	/* a list of nulls only: no literal for Lance */
-	if (k == 0)
+	/* a list of nulls only, or of no value: no literal for Lance */
+	if (((Const *) arr)->constisnull ||
+		!append_elements(buf, cls, typid, ((Const *) arr)->constvalue, false, &n, &k) ||
+		k == 0)
 		return false;
 	appendStringInfoString(buf, "))");
 	cxt->nsearch += k;
@@ -494,7 +671,15 @@ deparse(FilterContext *cxt, Node *node, StringInfo buf)
 	switch (nodeTag(node))
 	{
 		case T_OpExpr:
-			return deparse_opexpr(cxt, (OpExpr *) node, buf);
+			switch (((OpExpr *) node)->opno)
+			{
+				case OID_ARRAY_CONTAINS_OP:
+				case OID_ARRAY_CONTAINED_OP:
+				case OID_ARRAY_OVERLAP_OP:
+					return deparse_array_op(cxt, (OpExpr *) node, buf);
+				default:
+					return deparse_opexpr(cxt, (OpExpr *) node, buf);
+			}
 		case T_ScalarArrayOpExpr:
 			return deparse_in_list(cxt, (ScalarArrayOpExpr *) node, buf);
 		case T_NullTest:
@@ -617,6 +802,9 @@ lt_filter_from_quals(Relation rel, LtTable *t, List *quals, List **pushed)
 		}
 		if (contain_volatile_functions(clause))
 			continue;
+		/* a clause given up on under a NOT leaves its state */
+		cxt.negated = false;
+		cxt.or_depth = 0;
 		initStringInfo(&one);
 		if (!deparse(&cxt, clause, &one))
 			continue;
@@ -671,6 +859,7 @@ lt_filter_clause(PlannerInfo *root, Relation rel, LtTable *t, Index varno, Node 
 	fc->values = cxt.values;
 	fc->value_info = cxt.value_info;
 	fc->attnums = cxt.attnums;
+	fc->list_attnums = cxt.list_attnums;
 	fc->sargable = cxt.sargable;
 	fc->nsearch = Max(cxt.nsearch, 1);
 	return fc;
@@ -695,12 +884,13 @@ lt_filter_pieces_append(StringInfo buf, List *pieces, LtFilterValueFn fn, void *
 }
 
 /*
- * A value the scan was given, as the literal (or an IN list's literals) of
- * its column, info its lt_filter_clause()'s: false when Lance cannot take
- * it.  *never is set when the qual is false or NULL for every row whatever
- * the rest of it: a NULL value (or a list of nulls) with no OR above it,
- * nor an AND under a NOT, since NOT NULL is NULL; an empty list, whose
- * comparison is false, with no OR and no NOT above it.
+ * A value the scan was given, as the literal (or an IN list's or a list's
+ * literals) of its column, info its lt_filter_clause()'s: false when Lance
+ * cannot take it.  *never is set when the qual is false or NULL for every
+ * row whatever the rest of it: a NULL value (or a list of nulls) with no OR
+ * above it, nor an AND under a NOT, since NOT NULL is NULL; a value whose
+ * comparison is false -- an empty list, @> of an array with a NULL, && of
+ * one of nulls only or of none -- with no OR and no NOT above it.
  */
 bool
 lt_filter_value_append(StringInfo buf, List *info, Datum value, bool isnull, bool *never)
@@ -708,17 +898,11 @@ lt_filter_value_append(StringInfo buf, List *info, Datum value, bool isnull, boo
 	ColClass	cls = (ColClass) linitial_int(info);
 	Oid			coltype = (Oid) lsecond_int(info);
 	Oid			valtype = (Oid) lthird_int(info);
-	bool		array = lfourth_int(info) != 0;
+	ValueForm	form = (ValueForm) lfourth_int(info);
 	bool		strict = list_nth_int(info, 4) != 0;
 	bool		positive = list_nth_int(info, 5) != 0;
-	ArrayType  *a;
-	int16		elmlen;
-	bool		elmbyval;
-	char		elmalign;
-	Datum	   *elems;
-	bool	   *nulls;
 	int			n;
-	int			k = 0;
+	int			k;
 
 	if (isnull)
 	{
@@ -726,28 +910,25 @@ lt_filter_value_append(StringInfo buf, List *info, Datum value, bool isnull, boo
 			*never = true;
 		return false;
 	}
-	if (!array)
+	if (form == VALUE_LITERAL)
 		return append_const(buf, cls, coltype, valtype, value);
-	a = DatumGetArrayTypeP(value);
-	get_typlenbyvalalign(ARR_ELEMTYPE(a), &elmlen, &elmbyval, &elmalign);
-	deconstruct_array(a, ARR_ELEMTYPE(a), elmlen, elmbyval, elmalign, &elems, &nulls, &n);
-	if (n > MAX_IN_LIST)
+	if (form == VALUE_ELEMENT)
+		return append_element(buf, cls, coltype, valtype, value);
+	if (!append_elements(buf, cls, coltype, value, form != VALUE_IN_LIST, &n, &k))
 		return false;
-	for (int i = 0; i < n; i++)
-	{
-		if (nulls[i])
-			continue;
-		if (k++ > 0)
-			appendStringInfoString(buf, ", ");
-		if (!append_const(buf, cls, coltype, valtype, elems[i]))
-			return false;
-	}
-	if (k == 0)
+	if (form == VALUE_IN_LIST && k == 0)
 	{
 		/* = ANY of nulls is NULL; of no value, false */
 		if (strict && (n > 0 || positive))
 			*never = true;
 		return false;
 	}
-	return true;
+	if ((form == VALUE_HAS_ALL && k < n) || (form == VALUE_HAS_ANY && k == 0))
+	{
+		if (strict && positive)
+			*never = true;
+		return false;
+	}
+	/* @> of no value is true of every list: PostgreSQL's alone */
+	return k > 0;
 }

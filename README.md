@@ -75,14 +75,15 @@ As of 2026-10-27, built and tested against:
 - **Projection and filter pushdown**: LanceScan reads only the columns a
   query needs and gives Lance the quals it decides as PostgreSQL does --
   of constants, of a generic plan's parameters, of a nested loop's outer
-  row -- and is costed by the dataset's BTREE and BITMAP indexes that
-  answer them.  A scan that reads many rows runs in parallel, its workers
-  taking the dataset's fragments.
+  row, an array's `@>`, `&&` and `= ANY` among them -- and is costed by
+  the dataset's BTREE, BITMAP and LABEL_LIST indexes that answer them.  A
+  scan that reads many rows runs in parallel, its workers taking the
+  dataset's fragments.
 - **Lance's own indexes** (`lance_index`): IVF_FLAT, IVF_PQ, IVF_SQ,
   IVF_RQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, IVF_HNSW_SQ; BTREE, BITMAP,
   LABEL_LIST, INVERTED (full text), NGRAM, ZONEMAP, BLOOMFILTER -- the
-  tests build IVF_FLAT, IVF_PQ, IVF_HNSW_SQ, BTREE and BITMAP; the others
-  are Lance's parameters passed through.
+  tests build IVF_FLAT, IVF_PQ, IVF_HNSW_SQ, BTREE, BITMAP and LABEL_LIST;
+  the others are Lance's parameters passed through.
 - **PostgreSQL's own indexes** -- btree, hash, GIN, GiST, SP-GiST,
   unique and primary keys, `CREATE INDEX CONCURRENTLY`, parallel builds --
   over the rows' stable ids, valid through Lance's compaction.
@@ -229,21 +230,28 @@ VACUUM or `lance.optimize()` brings it up to them.
 
 LanceScan gives Lance the quals it decides as PostgreSQL does --
 comparisons of integer, boolean, date and text columns, `IN` lists, `IS
-[NOT] NULL`, and `AND`, `OR`, `NOT` of them -- with constants, or with
+[NOT] NULL`; of arrays of those types, `@>` and `&&` with an array and
+`= ANY` of an element, Lance's `array_has_all`, `array_has_any` and
+`array_has`; and `AND`, `OR`, `NOT` of them -- with constants, or with
 values known when the scan starts: a generic plan's parameters, an
 InitPlan's result, stable expressions of them, a nested loop's outer row.
 Such a filter is made again each time the scan starts.  A value Lance
 cannot take as a literal of its column (`smallint_col < 100000`) leaves its
-qual to PostgreSQL; a comparison with NULL reads nothing.
+qual to PostgreSQL; a comparison with NULL reads nothing.  Lance's array
+functions match a NULL element with NULL, which PostgreSQL's never do:
+`@>` of an array with a NULL and either operator with an empty array stay
+PostgreSQL's, `&&` is given its array without the NULLs, and `x = ANY
+(col)` is not given under a `NOT`.
 
 The planner costs a LanceScan as Lance runs it.  A BTREE or BITMAP
 `lance_index` that answers a qual -- equality, ranges, `IN`, `IS NULL`, ORs
-of them -- costs its searches and the reads of the rows it finds, and the
-rows it does not cover yet are read with the filter; without one, the
-filtered read.  For a join clause such an index answers, a LanceScan
-parameterized by the outer relation is offered, so that a nested loop
-searches the index for each outer row; `lance.scan_start_cost` is what each
-of those scans costs to start.
+of them -- or a LABEL_LIST one an array's `@>`, `&&` or `= ANY`, costs its
+searches and the reads of the rows it finds, and the rows it does not
+cover yet are read with the filter; without one, the filtered read.  For a
+join clause such an index answers, a LanceScan parameterized by the outer
+relation is offered, so that a nested loop searches the index for each
+outer row; `lance.scan_start_cost` is what each of those scans costs to
+start.
 
 ```
 CREATE INDEX pairs_origin ON pairs USING lance_index (origin_id) WITH (type = 'btree');

@@ -161,4 +161,101 @@ SELECT (i->>'rows')::bigint AS rows FROM jsonb_array_elements(lance.indices('pai
 WHERE i->>'name' = 'pairs_origin';
 SELECT count(*) FROM pairs WHERE origin = 99999;
 
-DROP TABLE pairs, wanted, ppairs, vitems;
+-- arrays, Lance's lists: @> and && of an array of the elements' type and
+-- = ANY of an element, as array_has_all, array_has_any and array_has, which
+-- a LABEL_LIST index answers.  Lance's match NULL with NULL: @> of an
+-- array with a NULL, && of nulls only, and an empty array stay
+-- PostgreSQL's, and so does NOT (= ANY), Lance's false where PostgreSQL's
+-- is NULL.  Each qual against a heap copy: no row of it missed, none read
+-- that PostgreSQL's quals remove.
+CREATE TABLE tagged (id int, tags text[], nums int[], small smallint[], days date[],
+  score float8[], emb vector(2)) USING lance;
+INSERT INTO tagged
+SELECT g,
+  CASE WHEN g % 50 = 0 THEN NULL
+       WHEN g % 97 = 3 THEN ARRAY['rare', 't' || g % 7]
+       WHEN g % 89 = 5 THEN ARRAY['it''s']
+       WHEN g % 10 = 1 THEN ARRAY['pg', NULL]
+       WHEN g % 10 = 2 THEN '{}'
+       ELSE ARRAY['t' || g % 7, 't' || g % 3] END,
+  CASE WHEN g % 40 = 0 THEN NULL WHEN g % 40 = 1 THEN ARRAY[NULL, 3]
+       ELSE ARRAY[g % 5, -(g % 4)] END,
+  ARRAY[g % 6]::smallint[], ARRAY[DATE '2026-01-01' + g % 9], ARRAY[g / 10.0],
+  ARRAY[g % 7, g % 11]::real[]::vector
+FROM generate_series(1, 5000) g;
+ANALYZE tagged;
+CREATE TABLE tagged_heap AS SELECT * FROM tagged;
+CREATE FUNCTION given(cond text, OUT lance_filter text, OUT missed bigint, OUT removed bigint)
+LANGUAGE plpgsql SET enable_seqscan = off AS $$
+DECLARE
+  plan jsonb;
+  matching bigint;
+BEGIN
+  EXECUTE 'SELECT count(*) FROM tagged_heap WHERE ' || cond INTO matching;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' ||
+    'SELECT id FROM tagged WHERE ' || cond INTO plan;
+  lance_filter := plan->0->'Plan'->>'Lance Filter';
+  missed := matching - (plan->0->'Plan'->>'Actual Rows')::numeric;
+  removed := (plan->0->'Plan'->>'Rows Removed by Filter')::numeric;
+END $$;
+CREATE TABLE conds (n serial, cond text);
+INSERT INTO conds (cond) VALUES
+  ($$tags @> ARRAY['t1']$$), ($$tags @> ARRAY['t1', 't2']$$), ($$tags @> ARRAY['pg']$$),
+  ($$ARRAY['t1'] <@ tags$$), ($$tags && ARRAY['t1', NULL, 'pg']$$), ($$ARRAY['rare'] && tags$$),
+  ($$NOT (tags @> ARRAY['t1'])$$), ($$NOT (tags && ARRAY['t1', 'pg'])$$),
+  ($$'pg' = ANY (tags)$$), ($$'zz' = ANY (tags) OR id < 10$$), ($$tags @> ARRAY['it''s']$$),
+  ($$nums @> ARRAY[1, -2]$$), ($$NOT (nums && ARRAY[3])$$), ($$3 = ANY (nums)$$),
+  ($$small && ARRAY[1, 2]::smallint[]$$), ($$4 = ANY (small)$$),
+  ($$days @> ARRAY[DATE '2026-01-03']$$),
+  ($$(tags @> ARRAY['t1'] OR 2 = ANY (nums)) AND NOT (days && ARRAY[DATE '2026-01-02'])$$),
+  ($$NOT (tags @> ARRAY['t1'] AND nums && ARRAY[0])$$),
+  ($$tags @> ARRAY['pg', NULL]$$), ($$tags @> '{}'$$), ($$tags && '{NULL}'$$),
+  ($$tags <@ ARRAY['t1', 't2']$$), ($$NOT ('t1' = ANY (tags))$$), ($$score @> ARRAY[0.5::float8]$$);
+SELECT n, cond, g.* FROM conds, LATERAL given(cond) g ORDER BY n;
+-- the same through LABEL_LIST indexes, which the plan counts on
+CREATE INDEX tagged_tags ON tagged USING lance_index (tags) WITH (type = 'label_list');
+CREATE INDEX tagged_nums ON tagged USING lance_index (nums) WITH (type = 'label_list');
+CREATE INDEX tagged_small ON tagged USING lance_index (small) WITH (type = 'label_list');
+CREATE INDEX tagged_days ON tagged USING lance_index (days) WITH (type = 'label_list');
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tagged WHERE tags @> ARRAY['t1'];
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tagged WHERE 3 = ANY (nums) AND id < 100;
+SELECT n, g.lance_filter IS NOT NULL AS given, g.missed, g.removed
+FROM conds, LATERAL given(cond) g ORDER BY n;
+-- a generic plan's arrays: @> of one with a NULL admits no row, of an
+-- empty one every list; NOT (&&) of nulls only is true
+SET plan_cache_mode = force_generic_plan;
+PREPARE has_all(text[]) AS SELECT count(*) FROM tagged WHERE tags @> $1;
+EXPLAIN (COSTS OFF) EXECUTE has_all('{t1}');
+EXECUTE has_all('{t1}');
+EXECUTE has_all('{t1,NULL}');
+EXECUTE has_all('{}');
+EXECUTE has_all(NULL);
+PREPARE has_none(text[]) AS SELECT count(*) FROM tagged WHERE NOT (tags && $1);
+EXECUTE has_none('{t1,NULL}');
+EXECUTE has_none('{NULL}');
+EXECUTE has_none('{}');
+PREPARE has_one(int) AS SELECT count(*) FROM tagged WHERE $1 = ANY (nums);
+EXPLAIN (COSTS OFF) EXECUTE has_one(3);
+EXECUTE has_one(3);
+EXECUTE has_one(NULL);
+PREPARE has_two(int, int) AS SELECT count(*) FROM tagged WHERE nums @> ARRAY[$1, $2];
+EXPLAIN (COSTS OFF) EXECUTE has_two(1, -2);
+EXECUTE has_two(1, -2);
+EXECUTE has_two(1, NULL);
+RESET plan_cache_mode;
+SELECT count(*) FILTER (WHERE tags @> '{t1}') AS has_t1, count(*) FILTER (WHERE tags @> '{}') AS has_none,
+  count(*) FILTER (WHERE NOT (tags && '{t1,NULL}')) AS not_t1,
+  count(*) FILTER (WHERE NOT (tags && '{NULL}')) AS not_null,
+  count(*) FILTER (WHERE 3 = ANY (nums)) AS any_3, count(*) FILTER (WHERE nums @> '{1,-2}') AS has_both
+FROM tagged_heap;
+-- a search filtered by an array: the filter before the search, the exact
+-- search's k rows; fetching 10 k, the 50 nearest, would find none
+EXPLAIN (COSTS OFF)
+SELECT id FROM tagged WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5;
+SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
+  (SELECT emb FROM tagged WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5) s;
+SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
+  (SELECT emb FROM tagged_heap WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5) s;
+
+DROP TABLE pairs, wanted, ppairs, vitems, tagged, tagged_heap, conds;
+DROP FUNCTION given;

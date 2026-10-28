@@ -16,9 +16,10 @@
  *	  index has no storage and no scan of its own: Lance uses the dataset's
  *	  indices itself -- a search LanceScan the vector index, a filter the
  *	  scalar ones -- and so does any other reader of the dataset; the
- *	  planner costs a LanceScan by the BTREE and BITMAP ones that answer its
- *	  quals (customscan.c).  Rows added later are searched without the index
- *	  until VACUUM (or lance.optimize()) brings it up to them.
+ *	  planner costs a LanceScan by the BTREE, BITMAP and LABEL_LIST ones that
+ *	  answer its quals (customscan.c).  Rows added later are searched
+ *	  without the index until VACUUM (or lance.optimize()) brings it up to
+ *	  them.
  *
  *	  The index's options become the Lance index's parameters: "type", and
  *	  the others as the type takes them (metric, num_partitions,

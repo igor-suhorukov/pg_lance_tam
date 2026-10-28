@@ -17,15 +17,15 @@
  *	  It is costed as Lance runs it: with no qual Lance decides, as a
  *	  sequential scan of the columns it reads; with quals, as that read
  *	  filtered by Lance, PostgreSQL's per-row work only for the rows Lance
- *	  yields; and with quals a BTREE or BITMAP index of the dataset answers
- *	  (lt_version_info), as the index's searches, the reads of the rows they
- *	  find -- the pages those are on, as an index scan's of heap pages, the
- *	  nearer to a sequential read the more the column's order is the
- *	  dataset's -- and the filtered read of the rows no index covers.  For a
- *	  join clause such an index answers, a LanceScan parameterized by the
- *	  clause's outer relations is offered too, for a nested loop that
- *	  searches the index for each outer row; each of its scans pays
- *	  lance.scan_start_cost.
+ *	  yields; and with quals a BTREE, BITMAP or LABEL_LIST index of the
+ *	  dataset answers (lt_version_info), as the index's searches, the reads
+ *	  of the rows they find -- the pages those are on, as an index scan's
+ *	  of heap pages, the nearer to a sequential read the more the column's
+ *	  order is the dataset's -- and the filtered read of the rows no index
+ *	  covers.  For a join clause such an index answers, a LanceScan
+ *	  parameterized by the clause's outer relations is offered too, for a
+ *	  nested loop that searches the index for each outer row; each of its
+ *	  scans pays lance.scan_start_cost.
  *
  *	  A plain LanceScan that no index answers is offered as a partial path
  *	  too, for a parallel plan: its participants take the version's
@@ -194,7 +194,8 @@ typedef struct LanceScanState
 
 /*
  * What Lance does of a scan's quals, as the planner costs it: the ones it
- * filters by, and of those the ones a BTREE or BITMAP index answers.
+ * filters by, and of those the ones a BTREE, BITMAP or LABEL_LIST index
+ * answers.
  */
 typedef struct LanceQuals
 {
@@ -291,16 +292,20 @@ read_fraction(Relation relation, List *attnums, bool all)
 	return Max(Min(read / total, 1.0), 0.02);
 }
 
-/* The dataset's BTREE or BITMAP index of the attribute, the widest, or NULL */
+/*
+ * The dataset's BTREE or BITMAP index of the attribute -- its LABEL_LIST
+ * index, for a list compared by its elements -- the widest, or NULL
+ */
 static LtIndexInfo *
-scalar_index(LtIndexInfo *indices, int nindices, AttrNumber attnum)
+scalar_index(LtIndexInfo *indices, int nindices, AttrNumber attnum, bool list)
 {
 	LtIndexInfo *best = NULL;
 
 	for (int i = 0; i < nindices; i++)
 	{
 		if (indices[i].attnum == attnum &&
-			(indices[i].kind == LT_INDEX_BTREE || indices[i].kind == LT_INDEX_BITMAP) &&
+			(list ? indices[i].kind == LT_INDEX_LABEL_LIST :
+			 (indices[i].kind == LT_INDEX_BTREE || indices[i].kind == LT_INDEX_BITMAP)) &&
 			(best == NULL || indices[i].rows > best->rows))
 			best = &indices[i];
 	}
@@ -318,7 +323,8 @@ qual_indexed(LtFilterClause *fc, LtIndexInfo *indices, int nindices, double *cov
 		return false;
 	while ((k = bms_next_member(fc->attnums, k)) >= 0)
 	{
-		LtIndexInfo *idx = scalar_index(indices, nindices, (AttrNumber) k);
+		LtIndexInfo *idx = scalar_index(indices, nindices, (AttrNumber) k,
+										bms_is_member(k, fc->list_attnums));
 
 		if (idx == NULL)
 			return false;
@@ -723,7 +729,7 @@ ec_member_matches(PlannerInfo *root, RelOptInfo *rel, EquivalenceClass *ec,
 		var = ((RelabelType *) var)->arg;
 	if (var == NULL || !IsA(var, Var) || ((Var *) var)->varno != rel->relid ||
 		((Var *) var)->varattno <= 0 ||
-		scalar_index(a->indices, a->nindices, ((Var *) var)->varattno) == NULL)
+		scalar_index(a->indices, a->nindices, ((Var *) var)->varattno, false) == NULL)
 		return false;
 	if (list_member(a->already_used, expr))
 		return false;

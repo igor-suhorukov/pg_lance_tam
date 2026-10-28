@@ -151,7 +151,8 @@ typedef enum LtIndexKind
 {
 	LT_INDEX_OTHER = 0,			/* one a filter's cost does not count on */
 	LT_INDEX_BTREE,
-	LT_INDEX_BITMAP
+	LT_INDEX_BITMAP,
+	LT_INDEX_LABEL_LIST			/* a list column's, of its elements */
 } LtIndexKind;
 
 typedef struct LtIndexInfo
@@ -445,9 +446,12 @@ typedef struct LtFilterClause
 								 * first value lt_filter_clause() was given */
 	List	   *value_info;		/* each one's, for lt_filter_value_append() */
 	Bitmapset  *attnums;		/* the columns it compares */
+	Bitmapset  *list_attnums;	/* those of them lists it compares by their
+								 * elements: what a LABEL_LIST index answers */
 	bool		sargable;		/* comparisons, IN lists, IS NULL, and ANDs
 								 * and ORs of them: what a BTREE or BITMAP
-								 * index answers */
+								 * index answers, and a LABEL_LIST index of
+								 * a list's elements */
 	int			nsearch;		/* the index searches it takes */
 } LtFilterClause;
 

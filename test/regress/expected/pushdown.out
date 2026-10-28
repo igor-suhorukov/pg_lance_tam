@@ -605,4 +605,289 @@ SELECT count(*) FROM pairs WHERE origin = 99999;
      1
 (1 row)
 
-DROP TABLE pairs, wanted, ppairs, vitems;
+-- arrays, Lance's lists: @> and && of an array of the elements' type and
+-- = ANY of an element, as array_has_all, array_has_any and array_has, which
+-- a LABEL_LIST index answers.  Lance's match NULL with NULL: @> of an
+-- array with a NULL, && of nulls only, and an empty array stay
+-- PostgreSQL's, and so does NOT (= ANY), Lance's false where PostgreSQL's
+-- is NULL.  Each qual against a heap copy: no row of it missed, none read
+-- that PostgreSQL's quals remove.
+CREATE TABLE tagged (id int, tags text[], nums int[], small smallint[], days date[],
+  score float8[], emb vector(2)) USING lance;
+INSERT INTO tagged
+SELECT g,
+  CASE WHEN g % 50 = 0 THEN NULL
+       WHEN g % 97 = 3 THEN ARRAY['rare', 't' || g % 7]
+       WHEN g % 89 = 5 THEN ARRAY['it''s']
+       WHEN g % 10 = 1 THEN ARRAY['pg', NULL]
+       WHEN g % 10 = 2 THEN '{}'
+       ELSE ARRAY['t' || g % 7, 't' || g % 3] END,
+  CASE WHEN g % 40 = 0 THEN NULL WHEN g % 40 = 1 THEN ARRAY[NULL, 3]
+       ELSE ARRAY[g % 5, -(g % 4)] END,
+  ARRAY[g % 6]::smallint[], ARRAY[DATE '2026-01-01' + g % 9], ARRAY[g / 10.0],
+  ARRAY[g % 7, g % 11]::real[]::vector
+FROM generate_series(1, 5000) g;
+ANALYZE tagged;
+CREATE TABLE tagged_heap AS SELECT * FROM tagged;
+CREATE FUNCTION given(cond text, OUT lance_filter text, OUT missed bigint, OUT removed bigint)
+LANGUAGE plpgsql SET enable_seqscan = off AS $$
+DECLARE
+  plan jsonb;
+  matching bigint;
+BEGIN
+  EXECUTE 'SELECT count(*) FROM tagged_heap WHERE ' || cond INTO matching;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' ||
+    'SELECT id FROM tagged WHERE ' || cond INTO plan;
+  lance_filter := plan->0->'Plan'->>'Lance Filter';
+  missed := matching - (plan->0->'Plan'->>'Actual Rows')::numeric;
+  removed := (plan->0->'Plan'->>'Rows Removed by Filter')::numeric;
+END $$;
+CREATE TABLE conds (n serial, cond text);
+INSERT INTO conds (cond) VALUES
+  ($$tags @> ARRAY['t1']$$), ($$tags @> ARRAY['t1', 't2']$$), ($$tags @> ARRAY['pg']$$),
+  ($$ARRAY['t1'] <@ tags$$), ($$tags && ARRAY['t1', NULL, 'pg']$$), ($$ARRAY['rare'] && tags$$),
+  ($$NOT (tags @> ARRAY['t1'])$$), ($$NOT (tags && ARRAY['t1', 'pg'])$$),
+  ($$'pg' = ANY (tags)$$), ($$'zz' = ANY (tags) OR id < 10$$), ($$tags @> ARRAY['it''s']$$),
+  ($$nums @> ARRAY[1, -2]$$), ($$NOT (nums && ARRAY[3])$$), ($$3 = ANY (nums)$$),
+  ($$small && ARRAY[1, 2]::smallint[]$$), ($$4 = ANY (small)$$),
+  ($$days @> ARRAY[DATE '2026-01-03']$$),
+  ($$(tags @> ARRAY['t1'] OR 2 = ANY (nums)) AND NOT (days && ARRAY[DATE '2026-01-02'])$$),
+  ($$NOT (tags @> ARRAY['t1'] AND nums && ARRAY[0])$$),
+  ($$tags @> ARRAY['pg', NULL]$$), ($$tags @> '{}'$$), ($$tags && '{NULL}'$$),
+  ($$tags <@ ARRAY['t1', 't2']$$), ($$NOT ('t1' = ANY (tags))$$), ($$score @> ARRAY[0.5::float8]$$);
+SELECT n, cond, g.* FROM conds, LATERAL given(cond) g ORDER BY n;
+ n  |                                        cond                                        |                                                       lance_filter                                                        | missed | removed 
+----+------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------+--------+---------
+  1 | tags @> ARRAY['t1']                                                                | array_has_all(`tags`, ['t1'])                                                                                             |      0 |       0
+  2 | tags @> ARRAY['t1', 't2']                                                          | array_has_all(`tags`, ['t1', 't2'])                                                                                       |      0 |       0
+  3 | tags @> ARRAY['pg']                                                                | array_has_all(`tags`, ['pg'])                                                                                             |      0 |       0
+  4 | ARRAY['t1'] <@ tags                                                                | array_has_all(`tags`, ['t1'])                                                                                             |      0 |       0
+  5 | tags && ARRAY['t1', NULL, 'pg']                                                    | array_has_any(`tags`, ['t1', 'pg'])                                                                                       |      0 |       0
+  6 | ARRAY['rare'] && tags                                                              | array_has_any(`tags`, ['rare'])                                                                                           |      0 |       0
+  7 | NOT (tags @> ARRAY['t1'])                                                          | (NOT array_has_all(`tags`, ['t1']))                                                                                       |      0 |       0
+  8 | NOT (tags && ARRAY['t1', 'pg'])                                                    | (NOT array_has_any(`tags`, ['t1', 'pg']))                                                                                 |      0 |       0
+  9 | 'pg' = ANY (tags)                                                                  | array_has(`tags`, 'pg')                                                                                                   |      0 |       0
+ 10 | 'zz' = ANY (tags) OR id < 10                                                       | (array_has(`tags`, 'zz') OR (`id` < 10))                                                                                  |      0 |       0
+ 11 | tags @> ARRAY['it''s']                                                             | array_has_all(`tags`, ['it''s'])                                                                                          |      0 |       0
+ 12 | nums @> ARRAY[1, -2]                                                               | array_has_all(`nums`, [CAST(1 AS INT), CAST(-2 AS INT)])                                                                  |      0 |       0
+ 13 | NOT (nums && ARRAY[3])                                                             | (NOT array_has_any(`nums`, [CAST(3 AS INT)]))                                                                             |      0 |       0
+ 14 | 3 = ANY (nums)                                                                     | array_has(`nums`, CAST(3 AS INT))                                                                                         |      0 |       0
+ 15 | small && ARRAY[1, 2]::smallint[]                                                   | array_has_any(`small`, [CAST(1 AS SMALLINT), CAST(2 AS SMALLINT)])                                                        |      0 |       0
+ 16 | 4 = ANY (small)                                                                    | array_has(`small`, CAST(4 AS SMALLINT))                                                                                   |      0 |       0
+ 17 | days @> ARRAY[DATE '2026-01-03']                                                   | array_has_all(`days`, [DATE '2026-01-03'])                                                                                |      0 |       0
+ 18 | (tags @> ARRAY['t1'] OR 2 = ANY (nums)) AND NOT (days && ARRAY[DATE '2026-01-02']) | (array_has_all(`tags`, ['t1']) OR array_has(`nums`, CAST(2 AS INT))) AND (NOT array_has_any(`days`, [DATE '2026-01-02'])) |      0 |       0
+ 19 | NOT (tags @> ARRAY['t1'] AND nums && ARRAY[0])                                     | ((NOT array_has_all(`tags`, ['t1'])) OR (NOT array_has_any(`nums`, [CAST(0 AS INT)])))                                    |      0 |       0
+ 20 | tags @> ARRAY['pg', NULL]                                                          |                                                                                                                           |      0 |    5000
+ 21 | tags @> '{}'                                                                       |                                                                                                                           |      0 |     100
+ 22 | tags && '{NULL}'                                                                   |                                                                                                                           |      0 |    5000
+ 23 | tags <@ ARRAY['t1', 't2']                                                          |                                                                                                                           |      0 |    3784
+ 24 | NOT ('t1' = ANY (tags))                                                            |                                                                                                                           |      0 |    2233
+ 25 | score @> ARRAY[0.5::float8]                                                        |                                                                                                                           |      0 |    4999
+(25 rows)
+
+-- the same through LABEL_LIST indexes, which the plan counts on
+CREATE INDEX tagged_tags ON tagged USING lance_index (tags) WITH (type = 'label_list');
+CREATE INDEX tagged_nums ON tagged USING lance_index (nums) WITH (type = 'label_list');
+CREATE INDEX tagged_small ON tagged USING lance_index (small) WITH (type = 'label_list');
+CREATE INDEX tagged_days ON tagged USING lance_index (days) WITH (type = 'label_list');
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tagged WHERE tags @> ARRAY['t1'];
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on tagged
+         Filter: (tags @> '{t1}'::text[])
+         Lance Columns: tags
+         Lance Filter: array_has_all(`tags`, ['t1'])
+         Lance Index: tagged_tags
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM tagged WHERE 3 = ANY (nums) AND id < 100;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on tagged
+         Filter: ((3 = ANY (nums)) AND (id < 100))
+         Lance Columns: id, nums
+         Lance Filter: array_has(`nums`, CAST(3 AS INT)) AND (`id` < 100)
+         Lance Index: tagged_nums
+(6 rows)
+
+SELECT n, g.lance_filter IS NOT NULL AS given, g.missed, g.removed
+FROM conds, LATERAL given(cond) g ORDER BY n;
+ n  | given | missed | removed 
+----+-------+--------+---------
+  1 | t     |      0 |       0
+  2 | t     |      0 |       0
+  3 | t     |      0 |       0
+  4 | t     |      0 |       0
+  5 | t     |      0 |       0
+  6 | t     |      0 |       0
+  7 | t     |      0 |       0
+  8 | t     |      0 |       0
+  9 | t     |      0 |       0
+ 10 | t     |      0 |       0
+ 11 | t     |      0 |       0
+ 12 | t     |      0 |       0
+ 13 | t     |      0 |       0
+ 14 | t     |      0 |       0
+ 15 | t     |      0 |       0
+ 16 | t     |      0 |       0
+ 17 | t     |      0 |       0
+ 18 | t     |      0 |       0
+ 19 | t     |      0 |       0
+ 20 | f     |      0 |    5000
+ 21 | f     |      0 |     100
+ 22 | f     |      0 |    5000
+ 23 | f     |      0 |    3784
+ 24 | f     |      0 |    2233
+ 25 | f     |      0 |    4999
+(25 rows)
+
+-- a generic plan's arrays: @> of one with a NULL admits no row, of an
+-- empty one every list; NOT (&&) of nulls only is true
+SET plan_cache_mode = force_generic_plan;
+PREPARE has_all(text[]) AS SELECT count(*) FROM tagged WHERE tags @> $1;
+EXPLAIN (COSTS OFF) EXECUTE has_all('{t1}');
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on tagged
+         Filter: (tags @> $1)
+         Lance Columns: tags
+         Lance Filter: array_has_all(`tags`, [$1])
+         Lance Index: tagged_tags
+(6 rows)
+
+EXECUTE has_all('{t1}');
+ count 
+-------
+  1644
+(1 row)
+
+EXECUTE has_all('{t1,NULL}');
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE has_all('{}');
+ count 
+-------
+  4900
+(1 row)
+
+EXECUTE has_all(NULL);
+ count 
+-------
+     0
+(1 row)
+
+PREPARE has_none(text[]) AS SELECT count(*) FROM tagged WHERE NOT (tags && $1);
+EXECUTE has_none('{t1,NULL}');
+ count 
+-------
+  3256
+(1 row)
+
+EXECUTE has_none('{NULL}');
+ count 
+-------
+  4900
+(1 row)
+
+EXECUTE has_none('{}');
+ count 
+-------
+  4900
+(1 row)
+
+PREPARE has_one(int) AS SELECT count(*) FROM tagged WHERE $1 = ANY (nums);
+EXPLAIN (COSTS OFF) EXECUTE has_one(3);
+                 QUERY PLAN                  
+---------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on tagged
+         Filter: ($1 = ANY (nums))
+         Lance Columns: nums
+         Lance Filter: array_has(`nums`, $1)
+         Lance Index: tagged_nums
+(6 rows)
+
+EXECUTE has_one(3);
+ count 
+-------
+  1125
+(1 row)
+
+EXECUTE has_one(NULL);
+ count 
+-------
+     0
+(1 row)
+
+PREPARE has_two(int, int) AS SELECT count(*) FROM tagged WHERE nums @> ARRAY[$1, $2];
+EXPLAIN (COSTS OFF) EXECUTE has_two(1, -2);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on tagged
+         Filter: (nums @> ARRAY[$1, $2])
+         Lance Columns: nums
+         Lance Filter: array_has_all(`nums`, [$1, $2])
+         Lance Index: tagged_nums
+(6 rows)
+
+EXECUTE has_two(1, -2);
+ count 
+-------
+   250
+(1 row)
+
+EXECUTE has_two(1, NULL);
+ count 
+-------
+     0
+(1 row)
+
+RESET plan_cache_mode;
+SELECT count(*) FILTER (WHERE tags @> '{t1}') AS has_t1, count(*) FILTER (WHERE tags @> '{}') AS has_none,
+  count(*) FILTER (WHERE NOT (tags && '{t1,NULL}')) AS not_t1,
+  count(*) FILTER (WHERE NOT (tags && '{NULL}')) AS not_null,
+  count(*) FILTER (WHERE 3 = ANY (nums)) AS any_3, count(*) FILTER (WHERE nums @> '{1,-2}') AS has_both
+FROM tagged_heap;
+ has_t1 | has_none | not_t1 | not_null | any_3 | has_both 
+--------+----------+--------+----------+-------+----------
+   1644 |     4900 |   3256 |     4900 |  1125 |      250
+(1 row)
+
+-- a search filtered by an array: the filter before the search, the exact
+-- search's k rows; fetching 10 k, the 50 nearest, would find none
+EXPLAIN (COSTS OFF)
+SELECT id FROM tagged WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Limit
+   ->  Result
+         ->  Custom Scan (LanceScan) on tagged
+               Filter: (tags @> '{rare}'::text[])
+               Lance Columns: id, tags, emb
+               Lance Filter: array_has_all(`tags`, ['rare'])
+               Lance Search: emb <-> $query, k=5, metric=l2, prefilter
+(7 rows)
+
+SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
+  (SELECT emb FROM tagged WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5) s;
+            array_agg            
+---------------------------------
+ {1.000,1.414,2.000,2.000,2.828}
+(1 row)
+
+SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
+  (SELECT emb FROM tagged_heap WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5) s;
+            array_agg            
+---------------------------------
+ {1.000,1.414,2.000,2.000,2.828}
+(1 row)
+
+DROP TABLE pairs, wanted, ppairs, vitems, tagged, tagged_heap, conds;
+DROP FUNCTION given;

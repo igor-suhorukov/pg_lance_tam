@@ -679,6 +679,8 @@ index_kind(const JsonbValue *type)
 		return LT_INDEX_BTREE;
 	if (type->val.string.len >= 6 && pg_strncasecmp(type->val.string.val, "bitmap", 6) == 0)
 		return LT_INDEX_BITMAP;
+	if (type->val.string.len >= 9 && pg_strncasecmp(type->val.string.val, "labellist", 9) == 0)
+		return LT_INDEX_LABEL_LIST;
 	return LT_INDEX_OTHER;
 }
 
