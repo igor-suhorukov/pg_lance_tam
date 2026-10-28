@@ -2,6 +2,7 @@
 # Lance's Python package beside the server (test/interop.sh): reads what
 # PostgreSQL wrote, writes what it reads.
 import sys
+from datetime import datetime, timezone
 
 import lance
 import pyarrow as pa
@@ -44,6 +45,23 @@ def main(step, uri):
                 "k": pa.array([1, 2, 3], pa.int32()),
                 "tag": pa.array(["a", "b", None], pa.utf8()),
                 "score": pa.array([0.5, 1.5, 2.5], pa.float64()),
+            }
+        )
+        lance.write_dataset(t, uri, enable_stable_row_ids=True)
+        print("python wrote", uri)
+    elif step == "stamps":
+        # the same instants as the server's own types and as others
+        inst = [datetime(2024, 1, 1, 0, 0, 0, 1000), datetime(2024, 1, 1, 0, 0, 0, 2000),
+                datetime(2024, 1, 1, 3), datetime(2024, 1, 2)]
+        utc = [i.replace(tzinfo=timezone.utc) for i in inst]
+        t = pa.table(
+            {
+                "k": pa.array([1, 2, 3, 4], pa.int32()),
+                "us": pa.array(inst, pa.timestamp("us")),
+                "utc": pa.array(utc, pa.timestamp("us", tz="UTC")),
+                "ms": pa.array(inst, pa.timestamp("ms")),
+                "ns": pa.array(inst, pa.timestamp("ns")),
+                "msk": pa.array(utc, pa.timestamp("us", tz="Europe/Moscow")),
             }
         )
         lance.write_dataset(t, uri, enable_stable_row_ids=True)

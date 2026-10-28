@@ -185,15 +185,16 @@ SELECT g,
 FROM generate_series(1, 5000) g;
 ANALYZE tagged;
 CREATE TABLE tagged_heap AS SELECT * FROM tagged;
-CREATE FUNCTION given(cond text, OUT lance_filter text, OUT missed bigint, OUT removed bigint)
+CREATE FUNCTION given(cond text, tab text DEFAULT 'tagged',
+  OUT lance_filter text, OUT missed bigint, OUT removed bigint)
 LANGUAGE plpgsql SET enable_seqscan = off AS $$
 DECLARE
   plan jsonb;
   matching bigint;
 BEGIN
-  EXECUTE 'SELECT count(*) FROM tagged_heap WHERE ' || cond INTO matching;
+  EXECUTE format('SELECT count(*) FROM %I WHERE ', tab || '_heap') || cond INTO matching;
   EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' ||
-    'SELECT id FROM tagged WHERE ' || cond INTO plan;
+    format('SELECT id FROM %I WHERE ', tab) || cond INTO plan;
   lance_filter := plan->0->'Plan'->>'Lance Filter';
   missed := matching - (plan->0->'Plan'->>'Actual Rows')::numeric;
   removed := (plan->0->'Plan'->>'Rows Removed by Filter')::numeric;
@@ -257,5 +258,65 @@ SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
 SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
   (SELECT emb FROM tagged_heap WHERE tags @> ARRAY['rare'] ORDER BY emb <-> '[0,0]' LIMIT 5) s;
 
-DROP TABLE pairs, wanted, ppairs, vitems, tagged, tagged_heap, conds;
+-- timestamps: their fields are the server's timestamp[us], without a time
+-- zone and with UTC, which Lance compares with a literal -- a timestamptz's
+-- in UTC -- as PostgreSQL does; infinities, years past 9999 and other
+-- types' values (a timestamp's for a timestamptz, which TimeZone decides,
+-- a date's) stay PostgreSQL's.  Each qual against a heap copy.
+CREATE TABLE stamps (id int, ts timestamp, tz timestamptz) USING lance;
+INSERT INTO stamps
+SELECT g,
+  CASE WHEN g = 1 THEN '-infinity' WHEN g = 2 THEN 'infinity' WHEN g = 3 THEN '12000-01-01'
+       WHEN g = 4 THEN '0100-06-01 BC' WHEN g % 50 = 0 THEN NULL
+       ELSE TIMESTAMP '2026-01-01' + make_interval(secs => g * 3600.000123) END,
+  CASE WHEN g = 1 THEN '-infinity' WHEN g = 2 THEN 'infinity' WHEN g % 40 = 0 THEN NULL
+       ELSE TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => g * 1800.000007) END
+FROM generate_series(1, 2000) g;
+ANALYZE stamps;
+CREATE TABLE stamps_heap AS SELECT * FROM stamps;
+SELECT ts::text FROM stamps WHERE id IN (1, 2, 3, 4, 10) ORDER BY id;
+SELECT tz AT TIME ZONE 'UTC' FROM stamps WHERE id IN (1, 2, 10) ORDER BY id;
+TRUNCATE conds RESTART IDENTITY;
+INSERT INTO conds (cond) VALUES
+  ($$ts = TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$ts <= TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$ts < TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$ts > TIMESTAMP '2026-01-01 10:00:00.001229'$$),
+  ($$ts <> TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$TIMESTAMP '2026-01-03' >= ts$$),
+  ($$ts IN (TIMESTAMP '2026-01-01 10:00:00.00123', TIMESTAMP '2026-01-01 11:00:00.001353', NULL)$$),
+  ($$ts > TIMESTAMP '9000-01-01'$$), ($$ts < TIMESTAMP '0001-01-01 00:00:01'$$),
+  ($$ts > TIMESTAMP '10000-01-01'$$), ($$ts > '-infinity'$$), ($$ts < 'infinity'$$),
+  ($$ts BETWEEN '2026-01-02' AND '2026-01-04 12:30' OR ts IS NULL$$),
+  ($$tz = TIMESTAMPTZ '2026-01-01 05:00:00.000070+00'$$),
+  ($$tz >= '2026-01-03 00:00:00+03'$$),
+  ($$tz BETWEEN '2026-01-02 00:00:00.5+00' AND '2026-01-04 12:00:00-05'$$),
+  ($$NOT (tz < '2026-01-03 00:00:00+00') AND tz < '2026-01-05'$$),
+  ($$tz IN ('2026-01-01 05:00:00.000070+00', '2026-01-01 05:30:00.000077+00')$$),
+  ($$tz > '-infinity' AND tz < 'infinity'$$),
+  ($$tz < TIMESTAMP '2026-01-03'$$), ($$ts >= DATE '2026-01-03'$$);
+SELECT n, cond, g.* FROM conds, LATERAL given(cond, 'stamps') g ORDER BY n;
+-- the same through BTREE indexes, which the plan counts on
+CREATE INDEX stamps_ts ON stamps USING lance_index (ts) WITH (type = 'btree');
+CREATE INDEX stamps_tz ON stamps USING lance_index (tz) WITH (type = 'btree');
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM stamps WHERE tz BETWEEN '2026-01-02 00:00:00+00' AND '2026-01-02 06:00:00+00';
+EXPLAIN (COSTS OFF)
+SELECT id FROM stamps WHERE ts IN (TIMESTAMP '2026-01-01 10:00:00.00123', TIMESTAMP '2026-01-01 11:00:00.001353');
+SELECT n, g.lance_filter IS NOT NULL AS given, g.missed, g.removed
+FROM conds, LATERAL given(cond, 'stamps') g ORDER BY n;
+-- a generic plan's timestamptz and a stable expression of it: an infinite
+-- value is no literal, and its qual PostgreSQL's
+SET plan_cache_mode = force_generic_plan;
+PREPARE since(timestamptz) AS SELECT count(*) FROM stamps WHERE tz > $1 - interval '1 day';
+EXPLAIN (COSTS OFF) EXECUTE since('2026-01-20 00:00:00+00');
+EXECUTE since('2026-01-20 00:00:00+00');
+EXECUTE since('-infinity');
+EXECUTE since(NULL);
+RESET plan_cache_mode;
+SELECT count(*) FILTER (WHERE tz > TIMESTAMPTZ '2026-01-19 00:00:00+00') AS since_19,
+  count(*) FILTER (WHERE tz > '-infinity') AS finite_or_inf
+FROM stamps_heap;
+
+DROP TABLE pairs, wanted, ppairs, vitems, tagged, tagged_heap, conds, stamps, stamps_heap;
 DROP FUNCTION given;

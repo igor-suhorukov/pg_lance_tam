@@ -144,7 +144,8 @@ extern void lt_lock_table_commit(Oid relid);
 /*
  * catalog.c: what the planner costs a scan of a version of a table's
  * dataset by (customscan.c) -- its fragments, which a parallel scan's
- * participants share out, and its Lance indices -- kept with the table's
+ * participants share out, and its Lance indices -- and its fields that
+ * filters may compare with timestamps (filter.c), kept with the table's
  * row: a version's never change.
  */
 typedef enum LtIndexKind
@@ -169,6 +170,12 @@ typedef struct LtVersionInfo
 	uint64		nfragments;
 	int			nindices;
 	LtIndexInfo *indices;
+	/*
+	 * The attributes whose field is the server's timestamp[us] without a
+	 * time zone, and with UTC: filters compare them with literals
+	 */
+	Bitmapset  *timestamps;
+	Bitmapset  *timestamptzs;
 } LtVersionInfo;
 
 extern LtVersionInfo *lt_version_info(Relation rel, uint64 version);

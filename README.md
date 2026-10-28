@@ -229,19 +229,24 @@ VACUUM or `lance.optimize()` brings it up to them.
 ### Filters and scalar indexes
 
 LanceScan gives Lance the quals it decides as PostgreSQL does --
-comparisons of integer, boolean, date and text columns, `IN` lists, `IS
-[NOT] NULL`; of arrays of those types, `@>` and `&&` with an array and
-`= ANY` of an element, Lance's `array_has_all`, `array_has_any` and
-`array_has`; and `AND`, `OR`, `NOT` of them -- with constants, or with
-values known when the scan starts: a generic plan's parameters, an
-InitPlan's result, stable expressions of them, a nested loop's outer row.
-Such a filter is made again each time the scan starts.  A value Lance
-cannot take as a literal of its column (`smallint_col < 100000`) leaves its
-qual to PostgreSQL; a comparison with NULL reads nothing.  Lance's array
-functions match a NULL element with NULL, which PostgreSQL's never do:
-`@>` of an array with a NULL and either operator with an empty array stay
-PostgreSQL's, `&&` is given its array without the NULLs, and `x = ANY
-(col)` is not given under a `NOT`.
+comparisons of integer, boolean, date, timestamp, timestamptz and text
+columns, `IN` lists, `IS [NOT] NULL`; of arrays of those types but the
+timestamps, `@>` and `&&` with an array and `= ANY` of an element, Lance's
+`array_has_all`, `array_has_any` and `array_has`; and `AND`, `OR`, `NOT`
+of them -- with constants, or with values known when the scan starts: a
+generic plan's parameters, an InitPlan's result, stable expressions of
+them (`now() - interval '1 day'`), a nested loop's outer row.  Such a
+filter is made again each time the scan starts.  A value Lance cannot take
+as a literal of its column (`smallint_col < 100000`, an infinite or
+year-10000 timestamp) leaves its qual to PostgreSQL; a comparison with NULL
+reads nothing.  A timestamp's qual is given where its column is the
+`timestamp[us]` the server writes, with UTC for a timestamptz: an attached
+dataset's other units and time zones keep it PostgreSQL's, since Lance
+would truncate the literal to milliseconds or read it in the field's zone.
+Lance's array functions match a NULL element with NULL, which PostgreSQL's
+never do: `@>` of an array with a NULL and either operator with an empty
+array stay PostgreSQL's, `&&` is given its array without the NULLs, and `x
+= ANY (col)` is not given under a `NOT`.
 
 The planner costs a LanceScan as Lance runs it.  A BTREE or BITMAP
 `lance_index` that answers a qual -- equality, ranges, `IN`, `IS NULL`, ORs

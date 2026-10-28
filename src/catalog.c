@@ -684,17 +684,58 @@ index_kind(const JsonbValue *type)
 	return LT_INDEX_OTHER;
 }
 
+/* The attribute a column of the dataset is, or 0 */
+static AttrNumber
+column_attnum(LtTable *t, const char *name)
+{
+	for (int a = 0; a < t->natts; a++)
+	{
+		if (t->columns[a] && strcmp(t->columns[a], name) == 0)
+			return a + 1;
+	}
+	return 0;
+}
+
+/*
+ * The attributes whose field is the timestamp[us] the server writes for a
+ * timestamp, and for a timestamptz, timestamp[us] with UTC (convert.c).  A
+ * dataset another writer made may have its timestamps in another unit or
+ * zone, with which Lance compares a literal in the coarser unit and the
+ * field's zone -- truncated to milliseconds, read as Moscow's time.
+ */
+static void
+timestamp_fields(LtTable *t, const struct ArrowSchema *schema, LtVersionInfo *vi)
+{
+	for (int64 i = 0; i < schema->n_children; i++)
+	{
+		const struct ArrowSchema *f = schema->children[i];
+		AttrNumber	attnum;
+
+		if (f->name == NULL || f->format == NULL || strncmp(f->format, "tsu:", 4) != 0)
+			continue;
+		attnum = column_attnum(t, f->name);
+		if (attnum == 0)
+			continue;
+		if (f->format[4] == '\0')
+			vi->timestamps = bms_add_member(vi->timestamps, attnum);
+		else if (strcmp(f->format + 4, "UTC") == 0 || strcmp(f->format + 4, "+00:00") == 0)
+			vi->timestamptzs = bms_add_member(vi->timestamptzs, attnum);
+	}
+}
+
 /*
  * A version's fragments, and its indices as the engine lists them, a segment
  * an entry: the segments of one index, which cover fragments apart, are
  * summed into one.  An engine that does not count an index's rows counts
- * its fragments, taken as the same share of the rows.
+ * its fragments, taken as the same share of the rows.  And the version's
+ * timestamp fields.
  */
 static LtVersionInfo *
 load_version_info(LtTable *t, uint64 version)
 {
 	LeDataset  *ds = lt_open_dataset(t, version);
 	LeDatasetInfo info;
+	struct ArrowSchema schema;
 	LeError		err = {0};
 	char	   *json = NULL;
 	int			rc;
@@ -708,10 +749,18 @@ load_version_info(LtTable *t, uint64 version)
 	int			cap = 4;
 
 	memset(&info, 0, sizeof(info));
+	memset(&schema, 0, sizeof(schema));
 	rc = lt_api()->indices(ds, &json, &err);
 	if (rc == LE_OK)
 		rc = lt_api()->dataset_info(ds, &info, &err);
+	if (rc == LE_OK)
+		rc = lt_api()->dataset_schema(ds, &schema, &err);
 	lt_api()->dataset_close(ds);
+	vi = palloc0(sizeof(LtVersionInfo));
+	if (rc == LE_OK)
+		timestamp_fields(t, &schema, vi);
+	if (schema.release)
+		schema.release(&schema);
 	if (rc != LE_OK)
 		lt_raise(&err, "reading a lance table's indices");
 	json = lt_take_string(json);
@@ -771,7 +820,6 @@ load_version_info(LtTable *t, uint64 version)
 		}
 		out[i].rows = Min(out[i].rows + rows, (double) info.num_rows);
 	}
-	vi = palloc0(sizeof(LtVersionInfo));
 	vi->version = version;
 	vi->nfragments = info.num_fragments;
 	vi->nindices = n;
@@ -791,13 +839,15 @@ copy_version_info(const LtVersionInfo *src)
 		vi->indices[i] = src->indices[i];
 		vi->indices[i].name = pstrdup(src->indices[i].name);
 	}
+	vi->timestamps = bms_copy(src->timestamps);
+	vi->timestamptzs = bms_copy(src->timestamptzs);
 	return vi;
 }
 
 /*
- * A version of the table's dataset, for the planner: its fragments and
- * indices, read from the engine once a version, since a version's never
- * change, and kept until the table's row is.
+ * A version of the table's dataset, for the planner: its fragments, indices
+ * and timestamp fields, read from the engine once a version, since a
+ * version's never change, and kept until the table's row is.
  */
 LtVersionInfo *
 lt_version_info(Relation rel, uint64 version)

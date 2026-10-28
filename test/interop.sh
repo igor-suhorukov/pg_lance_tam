@@ -56,6 +56,26 @@ createdb lance_interop
 	echo "pg after writes: $(q "SELECT string_agg(k || ':' || score, ' ' ORDER BY k) FROM pym")"
 	py count "$LT_WORK/py_made.lance"
 
+	echo "== timestamps: Lance filters the server's own types, PostgreSQL others"
+	py stamps "$LT_WORK/py_stamps.lance"
+	q "CREATE TABLE pyts () USING lance WITH (uri = '$LT_WORK/py_stamps.lance')"
+	psql -X -q -d lance_interop <<'SQL'
+CREATE FUNCTION lance_filter(cond text) RETURNS text
+LANGUAGE plpgsql SET enable_seqscan = off AS $$
+DECLARE p jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT k FROM pyts WHERE ' || cond INTO p;
+  RETURN coalesce(p->0->'Plan'->>'Lance Filter', 'none');
+END $$;
+SQL
+	for cond in "us < '2024-01-01 00:00:00.0015'" "utc < '2024-01-01 03:00:00+00'" \
+		"ms < '2024-01-01 00:00:00.0015'" "ns < '2024-01-01 00:00:00.0015'" \
+		"msk < '2024-01-01 03:00:00+00'"; do
+		echo "pg $cond: rows $(q "SELECT string_agg(k::text, ',' ORDER BY k) FROM pyts WHERE $cond")," \
+			"Lance filter $(q "SELECT lance_filter(\$c\$$cond\$c\$)")"
+	done
+	q "DROP TABLE pyts"
+
 	echo "== a dataset without stable row ids: read-only"
 	py plain "$LT_WORK/py_plain.lance"
 	q "CREATE TABLE pyp () USING lance WITH (uri = '$LT_WORK/py_plain.lance')"

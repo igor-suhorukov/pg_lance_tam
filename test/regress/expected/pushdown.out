@@ -629,15 +629,16 @@ SELECT g,
 FROM generate_series(1, 5000) g;
 ANALYZE tagged;
 CREATE TABLE tagged_heap AS SELECT * FROM tagged;
-CREATE FUNCTION given(cond text, OUT lance_filter text, OUT missed bigint, OUT removed bigint)
+CREATE FUNCTION given(cond text, tab text DEFAULT 'tagged',
+  OUT lance_filter text, OUT missed bigint, OUT removed bigint)
 LANGUAGE plpgsql SET enable_seqscan = off AS $$
 DECLARE
   plan jsonb;
   matching bigint;
 BEGIN
-  EXECUTE 'SELECT count(*) FROM tagged_heap WHERE ' || cond INTO matching;
+  EXECUTE format('SELECT count(*) FROM %I WHERE ', tab || '_heap') || cond INTO matching;
   EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) ' ||
-    'SELECT id FROM tagged WHERE ' || cond INTO plan;
+    format('SELECT id FROM %I WHERE ', tab) || cond INTO plan;
   lance_filter := plan->0->'Plan'->>'Lance Filter';
   missed := matching - (plan->0->'Plan'->>'Actual Rows')::numeric;
   removed := (plan->0->'Plan'->>'Rows Removed by Filter')::numeric;
@@ -889,5 +890,179 @@ SELECT array_agg(round((emb <-> '[0,0]')::numeric, 3)) FROM
  {1.000,1.414,2.000,2.000,2.828}
 (1 row)
 
-DROP TABLE pairs, wanted, ppairs, vitems, tagged, tagged_heap, conds;
+-- timestamps: their fields are the server's timestamp[us], without a time
+-- zone and with UTC, which Lance compares with a literal -- a timestamptz's
+-- in UTC -- as PostgreSQL does; infinities, years past 9999 and other
+-- types' values (a timestamp's for a timestamptz, which TimeZone decides,
+-- a date's) stay PostgreSQL's.  Each qual against a heap copy.
+CREATE TABLE stamps (id int, ts timestamp, tz timestamptz) USING lance;
+INSERT INTO stamps
+SELECT g,
+  CASE WHEN g = 1 THEN '-infinity' WHEN g = 2 THEN 'infinity' WHEN g = 3 THEN '12000-01-01'
+       WHEN g = 4 THEN '0100-06-01 BC' WHEN g % 50 = 0 THEN NULL
+       ELSE TIMESTAMP '2026-01-01' + make_interval(secs => g * 3600.000123) END,
+  CASE WHEN g = 1 THEN '-infinity' WHEN g = 2 THEN 'infinity' WHEN g % 40 = 0 THEN NULL
+       ELSE TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => g * 1800.000007) END
+FROM generate_series(1, 2000) g;
+ANALYZE stamps;
+CREATE TABLE stamps_heap AS SELECT * FROM stamps;
+SELECT ts::text FROM stamps WHERE id IN (1, 2, 3, 4, 10) ORDER BY id;
+               ts               
+--------------------------------
+ -infinity
+ infinity
+ Sat Jan 01 00:00:00 12000
+ Sat Jun 01 00:00:00 0100 BC
+ Thu Jan 01 10:00:00.00123 2026
+(5 rows)
+
+SELECT tz AT TIME ZONE 'UTC' FROM stamps WHERE id IN (1, 2, 10) ORDER BY id;
+            timezone            
+--------------------------------
+ -infinity
+ infinity
+ Thu Jan 01 05:00:00.00007 2026
+(3 rows)
+
+TRUNCATE conds RESTART IDENTITY;
+INSERT INTO conds (cond) VALUES
+  ($$ts = TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$ts <= TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$ts < TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$ts > TIMESTAMP '2026-01-01 10:00:00.001229'$$),
+  ($$ts <> TIMESTAMP '2026-01-01 10:00:00.00123'$$),
+  ($$TIMESTAMP '2026-01-03' >= ts$$),
+  ($$ts IN (TIMESTAMP '2026-01-01 10:00:00.00123', TIMESTAMP '2026-01-01 11:00:00.001353', NULL)$$),
+  ($$ts > TIMESTAMP '9000-01-01'$$), ($$ts < TIMESTAMP '0001-01-01 00:00:01'$$),
+  ($$ts > TIMESTAMP '10000-01-01'$$), ($$ts > '-infinity'$$), ($$ts < 'infinity'$$),
+  ($$ts BETWEEN '2026-01-02' AND '2026-01-04 12:30' OR ts IS NULL$$),
+  ($$tz = TIMESTAMPTZ '2026-01-01 05:00:00.000070+00'$$),
+  ($$tz >= '2026-01-03 00:00:00+03'$$),
+  ($$tz BETWEEN '2026-01-02 00:00:00.5+00' AND '2026-01-04 12:00:00-05'$$),
+  ($$NOT (tz < '2026-01-03 00:00:00+00') AND tz < '2026-01-05'$$),
+  ($$tz IN ('2026-01-01 05:00:00.000070+00', '2026-01-01 05:30:00.000077+00')$$),
+  ($$tz > '-infinity' AND tz < 'infinity'$$),
+  ($$tz < TIMESTAMP '2026-01-03'$$), ($$ts >= DATE '2026-01-03'$$);
+SELECT n, cond, g.* FROM conds, LATERAL given(cond, 'stamps') g ORDER BY n;
+ n  |                                            cond                                             |                                                 lance_filter                                                  | missed | removed 
+----+---------------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------+--------+---------
+  1 | ts = TIMESTAMP '2026-01-01 10:00:00.00123'                                                  | (`ts` = TIMESTAMP '2026-01-01 10:00:00.001230')                                                               |      0 |       0
+  2 | ts <= TIMESTAMP '2026-01-01 10:00:00.00123'                                                 | (`ts` <= TIMESTAMP '2026-01-01 10:00:00.001230')                                                              |      0 |       0
+  3 | ts < TIMESTAMP '2026-01-01 10:00:00.00123'                                                  | (`ts` < TIMESTAMP '2026-01-01 10:00:00.001230')                                                               |      0 |       0
+  4 | ts > TIMESTAMP '2026-01-01 10:00:00.001229'                                                 | (`ts` > TIMESTAMP '2026-01-01 10:00:00.001229')                                                               |      0 |       0
+  5 | ts <> TIMESTAMP '2026-01-01 10:00:00.00123'                                                 | (`ts` <> TIMESTAMP '2026-01-01 10:00:00.001230')                                                              |      0 |       0
+  6 | TIMESTAMP '2026-01-03' >= ts                                                                | (`ts` <= TIMESTAMP '2026-01-03 00:00:00')                                                                     |      0 |       0
+  7 | ts IN (TIMESTAMP '2026-01-01 10:00:00.00123', TIMESTAMP '2026-01-01 11:00:00.001353', NULL) | (`ts` IN (TIMESTAMP '2026-01-01 10:00:00.001230', TIMESTAMP '2026-01-01 11:00:00.001353'))                    |      0 |       0
+  8 | ts > TIMESTAMP '9000-01-01'                                                                 | (`ts` > TIMESTAMP '9000-01-01 00:00:00')                                                                      |      0 |       0
+  9 | ts < TIMESTAMP '0001-01-01 00:00:01'                                                        | (`ts` < TIMESTAMP '0001-01-01 00:00:01')                                                                      |      0 |       0
+ 10 | ts > TIMESTAMP '10000-01-01'                                                                |                                                                                                               |      0 |    1998
+ 11 | ts > '-infinity'                                                                            |                                                                                                               |      0 |      41
+ 12 | ts < 'infinity'                                                                             |                                                                                                               |      0 |      41
+ 13 | ts BETWEEN '2026-01-02' AND '2026-01-04 12:30' OR ts IS NULL                                | (((`ts` >= TIMESTAMP '2026-01-02 00:00:00') AND (`ts` <= TIMESTAMP '2026-01-04 12:30:00')) OR (`ts` IS NULL)) |      0 |       0
+ 14 | tz = TIMESTAMPTZ '2026-01-01 05:00:00.000070+00'                                            | (`tz` = TIMESTAMP '2026-01-01 05:00:00.000070')                                                               |      0 |       0
+ 15 | tz >= '2026-01-03 00:00:00+03'                                                              | (`tz` >= TIMESTAMP '2026-01-02 21:00:00')                                                                     |      0 |       0
+ 16 | tz BETWEEN '2026-01-02 00:00:00.5+00' AND '2026-01-04 12:00:00-05'                          | (`tz` >= TIMESTAMP '2026-01-02 00:00:00.500000') AND (`tz` <= TIMESTAMP '2026-01-04 17:00:00')                |      0 |       0
+ 17 | NOT (tz < '2026-01-03 00:00:00+00') AND tz < '2026-01-05'                                   | (`tz` >= TIMESTAMP '2026-01-03 00:00:00') AND (`tz` < TIMESTAMP '2026-01-05 08:00:00')                        |      0 |       0
+ 18 | tz IN ('2026-01-01 05:00:00.000070+00', '2026-01-01 05:30:00.000077+00')                    | (`tz` IN (TIMESTAMP '2026-01-01 05:00:00.000070', TIMESTAMP '2026-01-01 05:30:00.000077'))                    |      0 |       0
+ 19 | tz > '-infinity' AND tz < 'infinity'                                                        |                                                                                                               |      0 |      52
+ 20 | tz < TIMESTAMP '2026-01-03'                                                                 |                                                                                                               |      0 |    1892
+ 21 | ts >= DATE '2026-01-03'                                                                     |                                                                                                               |      0 |      85
+(21 rows)
+
+-- the same through BTREE indexes, which the plan counts on
+CREATE INDEX stamps_ts ON stamps USING lance_index (ts) WITH (type = 'btree');
+CREATE INDEX stamps_tz ON stamps USING lance_index (tz) WITH (type = 'btree');
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM stamps WHERE tz BETWEEN '2026-01-02 00:00:00+00' AND '2026-01-02 06:00:00+00';
+                                                                       QUERY PLAN                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on stamps
+         Filter: ((tz >= 'Thu Jan 01 16:00:00 2026 PST'::timestamp with time zone) AND (tz <= 'Thu Jan 01 22:00:00 2026 PST'::timestamp with time zone))
+         Lance Columns: tz
+         Lance Filter: (`tz` >= TIMESTAMP '2026-01-02 00:00:00') AND (`tz` <= TIMESTAMP '2026-01-02 06:00:00')
+         Lance Index: stamps_tz
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM stamps WHERE ts IN (TIMESTAMP '2026-01-01 10:00:00.00123', TIMESTAMP '2026-01-01 11:00:00.001353');
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LanceScan) on stamps
+   Filter: (ts = ANY ('{"Thu Jan 01 10:00:00.00123 2026","Thu Jan 01 11:00:00.001353 2026"}'::timestamp without time zone[]))
+   Lance Columns: id, ts
+   Lance Filter: (`ts` IN (TIMESTAMP '2026-01-01 10:00:00.001230', TIMESTAMP '2026-01-01 11:00:00.001353'))
+   Lance Index: stamps_ts
+(5 rows)
+
+SELECT n, g.lance_filter IS NOT NULL AS given, g.missed, g.removed
+FROM conds, LATERAL given(cond, 'stamps') g ORDER BY n;
+ n  | given | missed | removed 
+----+-------+--------+---------
+  1 | t     |      0 |       0
+  2 | t     |      0 |       0
+  3 | t     |      0 |       0
+  4 | t     |      0 |       0
+  5 | t     |      0 |       0
+  6 | t     |      0 |       0
+  7 | t     |      0 |       0
+  8 | t     |      0 |       0
+  9 | t     |      0 |       0
+ 10 | f     |      0 |    1998
+ 11 | f     |      0 |      41
+ 12 | f     |      0 |      41
+ 13 | t     |      0 |       0
+ 14 | t     |      0 |       0
+ 15 | t     |      0 |       0
+ 16 | t     |      0 |       0
+ 17 | t     |      0 |       0
+ 18 | t     |      0 |       0
+ 19 | f     |      0 |      52
+ 20 | f     |      0 |    1892
+ 21 | f     |      0 |      85
+(21 rows)
+
+-- a generic plan's timestamptz and a stable expression of it: an infinite
+-- value is no literal, and its qual PostgreSQL's
+SET plan_cache_mode = force_generic_plan;
+PREPARE since(timestamptz) AS SELECT count(*) FROM stamps WHERE tz > $1 - interval '1 day';
+EXPLAIN (COSTS OFF) EXECUTE since('2026-01-20 00:00:00+00');
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LanceScan) on stamps
+         Filter: (tz > ($1 - '@ 1 day'::interval))
+         Lance Columns: tz
+         Lance Filter: (`tz` > ($1 - '@ 1 day'::interval))
+         Lance Index: stamps_tz
+(6 rows)
+
+EXECUTE since('2026-01-20 00:00:00+00');
+ count 
+-------
+  1109
+(1 row)
+
+EXECUTE since('-infinity');
+ count 
+-------
+  1949
+(1 row)
+
+EXECUTE since(NULL);
+ count 
+-------
+     0
+(1 row)
+
+RESET plan_cache_mode;
+SELECT count(*) FILTER (WHERE tz > TIMESTAMPTZ '2026-01-19 00:00:00+00') AS since_19,
+  count(*) FILTER (WHERE tz > '-infinity') AS finite_or_inf
+FROM stamps_heap;
+ since_19 | finite_or_inf 
+----------+---------------
+     1109 |          1949
+(1 row)
+
+DROP TABLE pairs, wanted, ppairs, vitems, tagged, tagged_heap, conds, stamps, stamps_heap;
 DROP FUNCTION given;

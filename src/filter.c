@@ -6,15 +6,17 @@
  *	  has them, before PostgreSQL sees a row.
  *
  *	  Only what Lance decides as PostgreSQL does is given: comparisons of a
- *	  column with a constant on integer, boolean, date and text types (text
- *	  ranges under the C collation alone, equality under any deterministic
- *	  one, as byte equality is equality there), IN lists of those, IS
- *	  [NOT] NULL; of an array of those types, a list column, @> and && with
- *	  an array of its elements' type and = ANY of an element, Lance's
- *	  array_has_all, array_has_any and array_has, which a LABEL_LIST index
- *	  answers; and AND, OR and NOT of them.  Floating-point comparisons
- *	  stay PostgreSQL's: -0 and NaN compare otherwise in Arrow.  Every qual
- *	  is evaluated again by the executor, so a predicate given only narrows
+ *	  column with a constant on integer, boolean, date, timestamp and text
+ *	  types (text ranges under the C collation alone, equality under any
+ *	  deterministic one, as byte equality is equality there; a timestamp's
+ *	  where its field is the server's timestamp[us], without a time zone or
+ *	  with UTC), IN lists of those, IS [NOT] NULL; of an array of those
+ *	  types but timestamps, a list column, @> and && with an array of its
+ *	  elements' type and = ANY of an element, Lance's array_has_all,
+ *	  array_has_any and array_has, which a LABEL_LIST index answers; and
+ *	  AND, OR and NOT of them.  Floating-point comparisons stay
+ *	  PostgreSQL's: -0 and NaN compare otherwise in Arrow.  Every qual is
+ *	  evaluated again by the executor, so a predicate given only narrows
  *	  what is read.
  *
  *	  LanceScan's quals (lt_filter_clause) may compare a column with a value
@@ -48,6 +50,7 @@
 #include "utils/pg_locale.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/timestamp.h"
 
 #include "lance_tam.h"
 
@@ -74,6 +77,7 @@ typedef struct FilterContext
 	Bitmapset  *list_attnums;	/* the list columns compared by elements */
 	bool		sargable;
 	int			nsearch;
+	LtVersionInfo *vinfo;		/* the version's, once a timestamp needs it */
 } FilterContext;
 
 /*
@@ -123,6 +127,8 @@ typedef enum ColClass
 	COL_INT,
 	COL_BOOL,
 	COL_DATE,
+	COL_TIMESTAMP,
+	COL_TIMESTAMPTZ,
 	COL_TEXT
 } ColClass;
 
@@ -139,6 +145,10 @@ type_class(Oid typid)
 			return COL_BOOL;
 		case DATEOID:
 			return COL_DATE;
+		case TIMESTAMPOID:
+			return COL_TIMESTAMP;
+		case TIMESTAMPTZOID:
+			return COL_TIMESTAMPTZ;
 		case TEXTOID:
 		case VARCHAROID:
 			return COL_TEXT;
@@ -188,12 +198,34 @@ list_column(FilterContext *cxt, Node *node, ColClass *cls, Oid *elemtype)
 		return NULL;
 	*elemtype = getBaseType(*elemtype);
 	*cls = type_class(*elemtype);
-	if (*cls == COL_NONE)
+	/* a list of timestamps' field is not looked at (column_class) */
+	if (*cls == COL_NONE || *cls == COL_TIMESTAMP || *cls == COL_TIMESTAMPTZ)
 		return NULL;
 	if (IsA(node, RelabelType))
 		node = (Node *) ((RelabelType *) node)->arg;
 	cxt->list_attnums = bms_add_member(cxt->list_attnums, ((Var *) node)->varattno);
 	return column;
+}
+
+/*
+ * The class of a column var_column() found, compared with literals of it:
+ * a timestamp's only where the version's field is the server's own type
+ * (catalog.c), with which a literal compares as PostgreSQL's value does.
+ */
+static ColClass
+column_class(FilterContext *cxt, Node *node, Oid typid)
+{
+	ColClass	cls = type_class(typid);
+	Bitmapset  *exact;
+
+	if (cls != COL_TIMESTAMP && cls != COL_TIMESTAMPTZ)
+		return cls;
+	if (cxt->vinfo == NULL)
+		cxt->vinfo = lt_version_info(cxt->rel, lt_snapshot_version(cxt->rel, cxt->table, NULL));
+	if (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+	exact = cls == COL_TIMESTAMP ? cxt->vinfo->timestamps : cxt->vinfo->timestamptzs;
+	return bms_is_member(((Var *) node)->varattno, exact) ? cls : COL_NONE;
 }
 
 /* Whether a constant of the type is a literal of a column of the class */
@@ -208,12 +240,38 @@ const_type_ok(ColClass cls, Oid typid)
 			return typid == BOOLOID;
 		case COL_DATE:
 			return typid == DATEOID;
+		case COL_TIMESTAMP:
+			return typid == TIMESTAMPOID;
+		case COL_TIMESTAMPTZ:
+			return typid == TIMESTAMPTZOID;
 		case COL_TEXT:
 			return (typid == TEXTOID || typid == VARCHAROID) &&
 				(GetDatabaseEncoding() == PG_UTF8 || GetDatabaseEncoding() == PG_SQL_ASCII);
 		default:
 			return false;
 	}
+}
+
+/*
+ * A timestamp as Lance's literal of timestamp[us], a timestamptz's in UTC as
+ * its field holds it, or false: Lance reads years 1 to 9999 alone, and
+ * infinities, stored as the type's extremes, have no literal.
+ */
+static bool
+append_timestamp(StringInfo buf, Timestamp t)
+{
+	struct pg_tm tm;
+	fsec_t		fsec;
+
+	if (TIMESTAMP_NOT_FINITE(t) || timestamp2tm(t, NULL, &tm, &fsec, NULL, NULL) != 0 ||
+		tm.tm_year <= 0 || tm.tm_year > 9999)
+		return false;
+	appendStringInfo(buf, "TIMESTAMP '%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year, tm.tm_mon,
+					 tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+	if (fsec != 0)
+		appendStringInfo(buf, ".%06d", fsec);
+	appendStringInfoChar(buf, '\'');
+	return true;
 }
 
 /*
@@ -273,6 +331,11 @@ append_const(StringInfo buf, ColClass cls, Oid coltype, Oid typid, Datum value)
 				appendStringInfo(buf, "DATE '%04d-%02d-%02d'", year, month, day);
 				return true;
 			}
+		case COL_TIMESTAMP:
+		case COL_TIMESTAMPTZ:
+			if (!const_type_ok(cls, typid))
+				return false;
+			return append_timestamp(buf, DatumGetTimestamp(value));
 		case COL_TEXT:
 			if (typid != TEXTOID && typid != VARCHAROID)
 				return false;
@@ -486,7 +549,7 @@ deparse_opexpr(FilterContext *cxt, OpExpr *op, StringInfo buf)
 		right = (Node *) ((RelabelType *) right)->arg;
 	if (right == NULL || (IsA(right, Const) && ((Const *) right)->constisnull))
 		return false;
-	cls = type_class(typid);
+	cls = column_class(cxt, commuted ? lsecond(op->args) : linitial(op->args), typid);
 	if (cls == COL_NONE)
 		return false;
 	if (cls == COL_TEXT && !text_op_ok(op->inputcollid, is_equality))
@@ -637,7 +700,7 @@ deparse_in_list(FilterContext *cxt, ScalarArrayOpExpr *saop, StringInfo buf)
 	column = var_column(cxt, linitial(saop->args), &typid, &collid);
 	if (column == NULL)
 		return deparse_array_has(cxt, saop, buf);
-	cls = type_class(typid);
+	cls = column_class(cxt, linitial(saop->args), typid);
 	if (cls == COL_NONE || (cls == COL_TEXT && !text_op_ok(saop->inputcollid, true)))
 		return false;
 	arr = lsecond(saop->args);
