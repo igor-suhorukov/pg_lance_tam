@@ -362,16 +362,20 @@ impl WriteState {
         row | ((top as u64) << VERSION_SHIFT)
     }
 
+    /// What the transaction did to a row's version.  One it appended stays
+    /// Appended when it deleted it since, as a heap tuple's xmin stays its
+    /// own: a foreign key's check of an UPDATE that keeps the key is skipped
+    /// only for a row from before the transaction.
     pub fn row_state(&self, row: u64, cid: i64) -> RowState {
         let row_id = self.resolve(row, cid);
+        if self.is_pending(row_id) {
+            return RowState::Appended;
+        }
         if let Some(cid) = self.delete_cid(row_id) {
             return RowState::Deleted(cid);
         }
         if self.aborted.contains(row_id) {
             return RowState::Deleted(-1);
-        }
-        if self.is_pending(row_id) {
-            return RowState::Appended;
         }
         RowState::None
     }

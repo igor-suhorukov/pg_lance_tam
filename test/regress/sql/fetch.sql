@@ -66,6 +66,58 @@ SELECT count(*), count(*) FILTER (WHERE parent = 5000) FROM fk_next;
 DROP TABLE fk_next;
 DROP FUNCTION fk_next_fn();
 
+-- a row the transaction inserted stays its own once it deleted it: an UPDATE
+-- that keeps the key still checks it, for the check of the INSERT finds the
+-- row gone.  Whether the deletion reached the engine must not matter
+CREATE TABLE own_child (id int PRIMARY KEY, parent int REFERENCES fk_parent DEFERRABLE INITIALLY DEFERRED, note int) USING lance;
+-- by a scan: the deletion still gathered
+BEGIN;
+INSERT INTO own_child VALUES (0, 5000);
+UPDATE own_child SET id = id + 1;
+COMMIT;
+-- by a scan, the new key over a dead row's index entry, which the check of
+-- its uniqueness takes
+BEGIN;
+INSERT INTO own_child VALUES (1, 1);
+ROLLBACK;
+BEGIN;
+INSERT INTO own_child VALUES (0, 5000);
+UPDATE own_child SET id = id + 1;
+COMMIT;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET lance.enable_customscan = off;
+-- by the index: the fetch of the old row hands the deletion over
+BEGIN;
+INSERT INTO own_child VALUES (0, 5000);
+UPDATE own_child SET id = id + 1 WHERE id = 0;
+COMMIT;
+-- a version an UPDATE in place made of a committed row, then a new row
+INSERT INTO own_child VALUES (0, 1);
+BEGIN;
+UPDATE own_child SET parent = 5000 WHERE id = 0;
+UPDATE own_child SET id = id + 1 WHERE id = 0;
+COMMIT;
+SELECT * FROM own_child;
+-- the UPDATE rolled back to a savepoint leaves the INSERT's check
+TRUNCATE own_child;
+BEGIN;
+INSERT INTO own_child VALUES (0, 5000);
+SAVEPOINT s;
+UPDATE own_child SET id = id + 1 WHERE id = 0;
+ROLLBACK TO SAVEPOINT s;
+COMMIT;
+-- a row of an earlier transaction is not its own: the key kept, unchecked
+ALTER TABLE own_child DISABLE TRIGGER ALL;
+INSERT INTO own_child VALUES (0, 5000);
+ALTER TABLE own_child ENABLE TRIGGER ALL;
+UPDATE own_child SET id = id + 1 WHERE id = 0;
+SELECT * FROM own_child;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET lance.enable_customscan;
+DROP TABLE own_child;
+
 -- a TID scan, the transaction's deletions left out, with and without windows
 CREATE TEMP TABLE child_tids AS SELECT array_agg(ctid ORDER BY ctid) AS a FROM fk_child;
 BEGIN;

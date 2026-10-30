@@ -386,7 +386,7 @@ typedef struct LeApi
 typedef const LeApi *(*lance_engine_api_fn) (uint32_t abi_version);
 
 #define LE_WRITE_ROW_NONE		0	/* not the transaction's */
-#define LE_WRITE_ROW_APPENDED	1	/* appended by it, live */
-#define LE_WRITE_ROW_DELETED	2	/* deleted by it */
+#define LE_WRITE_ROW_APPENDED	1	/* appended by it, even if deleted by it since */
+#define LE_WRITE_ROW_DELETED	2	/* deleted by it, from before it; or rolled back */
 
 #endif							/* LANCE_ENGINE_H */
