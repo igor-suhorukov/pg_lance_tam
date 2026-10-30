@@ -891,6 +891,7 @@ impl WriteState {
                     new_fragments,
                     fields_modified: vec![],
                     compacted_sstables: vec![],
+                    mem_wal_dir_id: None,
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(UpdateMode::RewriteRows),
                     inserted_rows_filter: None,

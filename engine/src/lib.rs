@@ -39,7 +39,7 @@ static LIBRARY_VERSION: LazyLock<CString> = LazyLock::new(|| {
     .unwrap()
 });
 
-const LANCE_VERSION: &str = "14.0.0-beta.19";
+const LANCE_VERSION: &str = "15.0.0-beta.7";
 
 fn dataset_ref<'a>(ds: *mut LeDataset) -> Result<&'a LeDataset, EngineError> {
     if ds.is_null() {

@@ -3,15 +3,15 @@
 #
 # The engine library, built in the builder container (docker/compose.yml,
 # services "engine" and "engine-fetch"): engine/ is copied out of the
-# read-only tree into /build/src, built against Lance's checkout at /lance,
+# read-only tree into /build/src, built at the versions of its lockfile,
 # and the library left at /build/lib/liblance_engine.so.
 #
-#   engine.sh fetch   cargo fetch, the only step that reaches the network
+#   engine.sh fetch   cargo fetch: the lockfile's crates and Lance's repository
+#   engine.sh lock    cargo update: the newest versions engine/Cargo.toml
+#                     allows, left in /build/Cargo.lock for engine/Cargo.lock
 #   engine.sh build   cargo build --offline (the default)
 #
-# The lockfile lives in /build/Cargo.lock between runs; the first run seeds
-# it from engine/Cargo.lock, or else from Lance's own, so the dependency
-# versions are the ones Lance is tested with.
+# fetch and lock are the steps that reach the network.
 set -euo pipefail
 
 step="${1:-build}"
@@ -21,23 +21,18 @@ profile="${LT_ENGINE_PROFILE:-release}"
 rm -rf "$src"
 mkdir -p "$src" /build/lib
 cp -a /src/engine/. "$src/"
-if [ -f /build/Cargo.lock ]; then
-	cp /build/Cargo.lock "$src/Cargo.lock"
-elif [ -f /src/engine/Cargo.lock ]; then
-	: # copied with the tree
-else
-	cp /lance/Cargo.lock "$src/Cargo.lock"
-fi
 
 cd "$src"
 case "$step" in
 	fetch)
-		cargo fetch
+		cargo fetch --locked
+		;;
+	lock)
+		cargo update
 		cp Cargo.lock /build/Cargo.lock
 		;;
 	build)
-		cargo build --offline --profile "$profile" -j "${LT_ENGINE_JOBS:-24}"
-		cp Cargo.lock /build/Cargo.lock
+		cargo build --offline --locked --profile "$profile" -j "${LT_ENGINE_JOBS:-24}"
 		dir="$profile"
 		[ "$profile" = dev ] && dir=debug
 		cp "/build/target/$dir/liblance_engine.so" /build/lib/liblance_engine.so.tmp

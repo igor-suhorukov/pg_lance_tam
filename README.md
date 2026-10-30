@@ -24,9 +24,9 @@ As of 2026-10-30, built and tested against:
 | | |
 |---|---|
 | PostgreSQL | 19rc1: PGDG's packages (`19~rc1-1.pgdg13+1`) in Docker Hub's `postgres:19rc1-trixie`, without assertions -- the build PostGIS's 19rc1 image runs -- and the same release built from source with assertions (`lance_tam/dev:19rc1-assert`) |
-| Lance | Rust crates `14.0.0-beta.19` (checkout at `dc53d5d`), linked from the checkout |
+| Lance | Rust crates `15.0.0-beta.7`, from the tag `v15.0.0-beta.7` of Lance's repository: crates.io has no release of 15 yet |
 | pgvector | 0.8.7 |
-| pylance | 14.0.2, for the interop leg |
+| pylance | 14.0.2 from PyPI, for the interop leg, which passes on Lance's pre-release 15.0.0b7 too |
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
 - Every leg of `test/run.sh` passes, on both builds: `checks` (the ABI's two
@@ -50,6 +50,11 @@ As of 2026-10-30, built and tested against:
   referenced row while the foreign key's check holds the unique index's
   page locked -- passes since UPDATEs keep TIDs in place: a lance UPDATE
   used to insert into that page, and the backend waited on its own lock.
+- Moving from Lance 14.0.0-beta.19 to 15.0.0-beta.7 changed none of this:
+  every leg passes on both builds, and the same 117 files differ, their
+  output the same but for TIDs, `now()`, pointers and one count of `stats`.
+  A dataset the earlier Lance wrote reads the same, and takes writes,
+  VACUUM and new indexes, each checked against a heap table.
 
 ## What it does
 
@@ -163,6 +168,13 @@ SELECT lance.refresh('events');    -- take other writers' commits into the table
 A dataset without stable row ids is read-only.  A writable table's commits
 land on top of other writers' commits; `lance.refresh()` takes them into
 the table, and says when PostgreSQL's indexes over it need a `REINDEX`.
+
+Lance 15 keeps writers before it off a dataset with stable row ids and an
+index that holds row addresses: a BTREE, ZONEMAP or BLOOMFILTER, or a BITMAP
+or LABEL_LIST built on Lance 15.  From the first commit on Lance 15 they read
+it, without a BITMAP or LABEL_LIST so built, and refuse to write it, Lance's
+Python package 14 among them; a commit after the last such index is dropped
+lets them write again.
 
 ### Options of a table
 
@@ -330,6 +342,15 @@ small integers on 32 CPUs (0.67 s), where one task with 64 MB took 216 MB
 (0.76 s).  VACUUM leaves `pg_stat_user_tables` and `pg_class` as heap's
 VACUUM does, so that autovacuum counts a table's changes from it.
 
+The compaction's commit also moves the rows of the indexes that hold row
+addresses to the new fragments, so that those indexes keep covering them.
+The moves are reckoned from the rewrite's ranges, where Lance's default keeps
+a map entry for every row.  Thirty million rows in 300 fragments, with a BTREE
+and a BITMAP, took a backend to 528 MB (VACUUM 2.7 s), against 2.9 GB (17.6 s)
+by Lance's default and 806 MB (3.4 s) on Lance 14, which left the indexes to
+catch up after it; ninety million, 1.0 GB (8.7 s) against 2.0 GB (25.6 s) on
+Lance 14.  A cancel waits for the commit, moves included.
+
 VACUUM also removes from the table's PostgreSQL indexes the entries of rows
 no snapshot will see again -- the rows of a rollback, the rows a commit
 deleted -- unless `INDEX_CLEANUP OFF` says otherwise; autovacuum does when the
@@ -460,20 +481,24 @@ are pgvector's.
 
 | | heap + pgvector | lance |
 |---|---|---|
-| `INSERT ... SELECT` 200,000 rows | 149 ms | 124 ms |
-| `sum(cat)` | 9.2 ms | 5.7 ms |
-| `sum(length(label))` | 14.2 ms | 12.5 ms |
-| `count(*) WHERE cat = 7` | 8.7 ms | 0.9 ms (Lance's filter) |
-| exact 10 nearest, no index | 46.6 ms | 19.3 ms (Lance's flat search) |
-| vector index build | HNSW 8.3 s; IVFFlat (256 lists) 0.57 s | IVF_PQ (256 partitions, 16 sub-vectors) 3.8 s; IVF_HNSW_SQ (16 partitions) 1.4 s |
-| 10 nearest through the index | HNSW 0.19 ms, recall 10/10 | IVF_PQ 2.3 ms, 10/10; IVF_HNSW_SQ 1.4 ms, 10/10 |
-| `UPDATE` 2,000 rows | 381 ms (the HNSW index's inserts) | 70 ms |
-| `DELETE` 2,000 rows | 15 ms | 32 ms |
-| `VACUUM` after them | 11.0 s (HNSW) | 2.0 s (compaction, the index brought up to date) |
+| `INSERT ... SELECT` 200,000 rows | 158 ms | 169 ms |
+| `sum(cat)` | 8.9 ms | 5.8 ms |
+| `sum(length(label))` | 12.2 ms | 9.9 ms |
+| `count(*) WHERE cat = 7` | 6.8 ms | 0.8 ms (Lance's filter) |
+| exact 10 nearest, no index | 41.4 ms | 15.7 ms (Lance's flat search) |
+| vector index build | HNSW 8.3 s; IVFFlat (256 lists) 0.54 s | IVF_PQ (256 partitions, 16 sub-vectors) 1.6 s; IVF_HNSW_SQ (16 partitions) 1.4 s |
+| 10 nearest through the index | HNSW 0.13 ms, recall 10/10 | IVF_PQ 2.2 ms, 10/10; IVF_HNSW_SQ 2.1 ms, 10/10 |
+| `UPDATE` 2,000 rows | 350 ms (the HNSW index's inserts) | 82 ms |
+| `DELETE` 2,000 rows | 17 ms | 43 ms |
+| `VACUUM` after them | 10.1 s (HNSW) | 0.10 s (compaction; no new rows for the index) |
 | size | 272 MB with its index | 99 MB of data files |
 
 A search through a vector index is slower than pgvector's HNSW because each
-Lance scan costs about a millisecond to set up.
+Lance scan costs about a millisecond to set up; repeated, one takes about 2
+ms through IVF_PQ and 1 ms through IVF_HNSW_SQ.  Against Lance 14, the same
+run builds IVF_PQ in 1.6 s against 3.9 s, and the VACUUM takes 0.10 s against
+2.3 s, when it optimized the indexes though no new rows had come; the rest
+is the same within the runs' noise.
 
 A foreign key on a lance table checks each row a statement writes by
 fetching the row by its TID.  A fetch by TID is a Lance take of about 0.1
@@ -572,8 +597,8 @@ Open:
 ## Building and testing
 
 Everything builds and runs in containers (`docker/`, `test/run.sh`); the
-host needs Docker with Compose v2, and Lance's checkout beside this one
-(`LT_LANCE_SRC`, default `~/dev/projects/oss_databases/github/lance`).
+host needs Docker with Compose v2.  `engine/Cargo.lock` pins Lance's crates
+and every other crate of the engine.
 Each run's results go to `~/.cache/pg_vexec/lance_tam/runs/<time>-<leg>`.
 The dev image is Docker Hub's `postgres:19rc1-trixie` with PGXS at the
 server's own version; `LT_PG_TAG` names another tag of that image (a later
@@ -584,7 +609,8 @@ from the same release with `--enable-cassert` (`docker/Dockerfile.assert`).
 ```
 test/run.sh images     # the engine builder and the dev image (postgres:19rc1-trixie, pgvector, pylance)
 test/run.sh assert-image  # the dev image with assertions: 19rc1 built from its source release
-test/run.sh fetch      # cargo fetch: the one step that reaches the network
+test/run.sh fetch      # cargo fetch: Lance's repository and the crates, at the lockfile's versions
+test/run.sh lock       # cargo update: the newest versions Cargo.toml allows, in the engine cache's Cargo.lock
 test/run.sh engine     # liblance_engine.so, into ~/.cache/pg_vexec/lance_tam/engine/lib
 test/run.sh checks     # the C ABI's two declarations agree
 test/run.sh suite      # the regression suite (test/regress)
@@ -599,8 +625,7 @@ test/run.sh all        # checks, engine, suite, recovery, s3, interop, vexec
 ```
 
 To install elsewhere: build the engine library (`cargo build --release` in
-`engine/`, with Lance's checkout at `/lance` or `engine/Cargo.toml`'s paths
-changed), then `make && make install` with your PostgreSQL 19's
+`engine/`), then `make && make install` with your PostgreSQL 19's
 `pg_config`, and copy `liblance_engine.so` to `$(pg_config --pkglibdir)`.
 Preload the module (`shared_preload_libraries = 'lance_tam'`) for its
 options and DDL handling, and for pg_vexec's source and sink.

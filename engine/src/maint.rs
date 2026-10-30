@@ -7,7 +7,8 @@ use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{
-    CompactionMetrics, CompactionOptions, RewriteResult, commit_compaction, plan_compaction,
+    CompactionMetrics, CompactionOptions, IndexRemapMode, RewriteResult, commit_compaction,
+    plan_compaction,
 };
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
@@ -219,6 +220,11 @@ fn options_object(options: Option<&str>) -> EResult<Map<String, Value>> {
 
 fn compaction_options(p: &Map<String, Value>) -> EResult<CompactionOptions> {
     let mut compaction = CompactionOptions::default();
+    // The commit moves the rows of the indices that hold row addresses, under
+    // the table's commit lock.  Lance's default keeps a hash map's entry for
+    // every row rewritten, which nothing here bounds; this reckons each move
+    // from the rewrite's ranges.
+    compaction.index_remap_mode = IndexRemapMode::Compact;
     if let Some(n) = get_usize(p, "target_rows_per_fragment")? {
         compaction.target_rows_per_fragment = n;
     }

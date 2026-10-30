@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Builder of liblance_engine.so (docs/design.md §2.2): the Rust crate in
-# engine/, which links Lance from the checkout mounted read-only at /lance.
+# engine/, which links Lance's crates at the versions of its lockfile.
 # Debian trixie, like the dev image's postgres:19rc1-trixie, so the library
 # asks for no newer glibc than the server image has.  Lance's build scripts
 # compile its protobuf definitions with protoc.

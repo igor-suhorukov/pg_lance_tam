@@ -9,7 +9,11 @@
 #   run.sh images        the builder and dev images
 #   run.sh assert-image  the dev image with assertions: PostgreSQL built
 #                        from its source release with --enable-cassert
-#   run.sh fetch         cargo fetch for the engine (the only leg with the
+#   run.sh fetch         cargo fetch for the engine: the lockfile's crates
+#                        and Lance's repository (a leg with the network)
+#   run.sh lock          cargo update for the engine: the newest versions
+#                        engine/Cargo.toml allows, left in the engine cache's
+#                        Cargo.lock for engine/Cargo.lock (a leg with the
 #                        network)
 #   run.sh engine        the engine library, ~/.cache/pg_accel/lance_tam/engine
 #   run.sh build         the extension built and installed in a dev container
@@ -36,7 +40,6 @@
 #   LT_CACHE      the runs: ~/.cache/pg_accel/lance_tam
 #   LT_CPUS       each container's CPUs: 0, as many as there are
 #   LT_TESTS      the suite's tests, all by default
-#   LT_LANCE_SRC  Lance's checkout: ~/dev/projects/oss_databases/github/lance
 #   LT_PG_ACCEL   pg_accel's tree, for vexec
 #   LT_RUN        repro: the run directory that holds repro1.sql
 #   LT_DEV_IMAGE  the image the legs run on: lance_tam/dev:19rc1-trixie;
@@ -75,6 +78,8 @@ case "${1:-}" in
 		compose --profile build build lt-dev-assert ;;
 	fetch)
 		leg fetch engine-fetch /src/test/engine.sh fetch ;;
+	lock)
+		leg lock engine-fetch /src/test/engine.sh lock ;;
 	engine)
 		leg engine engine /src/test/engine.sh build ;;
 	build)

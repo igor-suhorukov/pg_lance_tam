@@ -6,10 +6,11 @@
 #
 #   lt-engine-builder  Dockerfile.engine: Rust on Debian trixie, for the
 #                      engine library
-#   engine             test/engine.sh build: the tree read-only at /src,
-#                      Lance's checkout read-only at /lance, the build tree
-#                      and cargo's caches at /build and /cargo, no network
-#   engine-fetch       test/engine.sh fetch: the same, with the network
+#   engine             test/engine.sh build: the tree read-only at /src, the
+#                      build tree and cargo's caches at /build and /cargo, no
+#                      network
+#   engine-fetch       test/engine.sh fetch and lock: the same, with the
+#                      network
 #   lt-dev-vanilla     Dockerfile.dev: Docker Hub's postgres image of
 #                      PostgreSQL 19 (LT_PG_TAG: 19rc1-trixie, PGDG's
 #                      packages on Debian trixie) with PGXS, pgvector,
@@ -60,7 +61,6 @@ x-engine: &engine
     - /tmp:exec
   volumes:
     - ..:/src:ro
-    - ${LT_LANCE_SRC:-${HOME}/dev/projects/oss_databases/github/lance}:/lance:ro
     - ${LT_ENGINE_BUILD:-${HOME}/.cache/pg_accel/lance_tam/engine}:/build
     - ${LT_CARGO_HOME:-${HOME}/.cache/pg_accel/lance_tam/cargo}:/cargo
   environment:
