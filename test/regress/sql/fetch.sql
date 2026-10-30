@@ -166,3 +166,42 @@ RESET lance.enable_customscan;
 SELECT (SELECT array[count(*), sum(k), sum(length(v))] FROM up) =
        (SELECT array[count(*), sum(k), sum(length(v))] FROM up_heap) AS same_after_commit;
 DROP TABLE up, up_heap;
+
+-- a row still in the batch being formed is found by a fetch of it, though
+-- fetches of other rows leave the batch where it is
+CREATE TABLE b (id int PRIMARY KEY, n int) USING lance;
+INSERT INTO b SELECT g, 0 FROM generate_series(1, 100) g;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET lance.enable_customscan = off;
+BEGIN;
+INSERT INTO b VALUES (1000, 1);
+SELECT n FROM b WHERE id = 50;
+SELECT n FROM b WHERE id = 1000;
+INSERT INTO b VALUES (1001, 1);
+UPDATE b SET n = 2 WHERE id = 1001;
+SELECT n FROM b WHERE id = 1001;
+INSERT INTO b VALUES (1002, 1);
+DELETE FROM b WHERE id = 1002;
+SELECT count(*) FROM b WHERE id = 1002;
+UPDATE b SET n = 3 WHERE id = 60;
+SELECT n FROM b WHERE id = 61;
+SELECT n FROM b WHERE id = 60;
+DELETE FROM b WHERE id = 70;
+SELECT n FROM b WHERE id = 71;
+SELECT count(*) FROM b WHERE id = 70;
+SAVEPOINT s;
+INSERT INTO b VALUES (1003, 1);
+INSERT INTO b VALUES (1003, 1);
+ROLLBACK TO SAVEPOINT s;
+SAVEPOINT s2;
+INSERT INTO b SELECT 1004, 1 UNION ALL SELECT 1004, 2;
+ROLLBACK TO SAVEPOINT s2;
+INSERT INTO b VALUES (1003, 5);
+COMMIT;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET lance.enable_customscan;
+SELECT count(*), sum(n) FROM b;
+SELECT id, n FROM b WHERE id >= 1000 OR id IN (60, 61, 70) ORDER BY id;
+DROP TABLE b;

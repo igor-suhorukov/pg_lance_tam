@@ -50,6 +50,7 @@ bool		lt_scan_in_order = true;
 bool		lt_vacuum_compact = true;
 int			lt_version_retention = 3600;
 int			lt_debug_fail_after_commit = 0;
+int			lt_debug_vacuum_wait = 0;
 bool		lt_preloaded = false;
 
 void		_PG_init(void);
@@ -135,11 +136,18 @@ _PG_init(void)
 							"Tests only: after a table's Lance commit, 1 raises an error, 2 aborts the process.",
 							NULL, &lt_debug_fail_after_commit, 0, 0, 2, PGC_SUSET,
 							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
+	DefineCustomIntVariable("lance.debug_vacuum_wait",
+							"Tests only: a VACUUM that removes index entries waits for this advisory lock once it has read the row ids; 0: none.",
+							NULL, &lt_debug_vacuum_wait, 0, 0, INT_MAX, PGC_SUSET,
+							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	MarkGUCPrefixReserved("lance");
 
 	lt_options_init();
 	lt_xact_init();
 	lt_customscan_init();
 	if (process_shared_preload_libraries_in_progress)
+	{
+		lt_rowids_init();
 		lt_vexec_init();
+	}
 }

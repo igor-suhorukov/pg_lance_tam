@@ -11,4 +11,5 @@ test: pushdown
 test: parallel
 test: inplace
 test: fetch
+test: deadrows
 test: vacuum

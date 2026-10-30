@@ -1,0 +1,636 @@
+-- The index entries of rows no snapshot will see again (docs/design.md §2.6):
+-- a rollback's rows, the rows a commit deleted.  A fetch that finds no such
+-- row has the index mark the entry dead; an open transaction's rows, and the
+-- rows an old snapshot still reads, keep their entries.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE EXTENSION IF NOT EXISTS dblink;
+RESET client_min_messages;
+SELECT dblink_connect('other', 'dbname=' || current_database());
+ dblink_connect 
+----------------
+ OK
+(1 row)
+
+SELECT dblink_exec('other', 'SET enable_seqscan = off');
+ dblink_exec 
+-------------
+ SET
+(1 row)
+
+SELECT dblink_exec('other', 'SET enable_bitmapscan = off');
+ dblink_exec 
+-------------
+ SET
+(1 row)
+
+SELECT dblink_exec('other', 'SET lance.enable_customscan = off');
+ dblink_exec 
+-------------
+ SET
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET lance.enable_customscan = off;
+-- the entries of an index of one leaf page, and those marked dead
+CREATE FUNCTION entries(idx text, OUT items bigint, OUT dead bigint) LANGUAGE sql AS $$
+    SELECT count(*), count(*) FILTER (WHERE i.dead) FROM bt_page_items(idx, 1) i
+$$;
+-- a rollback's keys again: each uniqueness check finds the row gone and has
+-- its entry marked
+CREATE TABLE d_pk (id int PRIMARY KEY, v text) USING lance;
+INSERT INTO d_pk VALUES (0, 'committed');
+BEGIN;
+INSERT INTO d_pk SELECT g, 'rolled back' FROM generate_series(1, 100) g;
+ROLLBACK;
+SELECT * FROM entries('d_pk_pkey');
+ items | dead 
+-------+------
+   101 |    0
+(1 row)
+
+INSERT INTO d_pk SELECT g, 'again' FROM generate_series(1, 100) g;
+SELECT * FROM entries('d_pk_pkey');
+ items | dead 
+-------+------
+   201 |  100
+(1 row)
+
+SELECT count(*), min(v), max(v) FROM d_pk WHERE id BETWEEN 1 AND 100;
+ count |  min  |  max  
+-------+-------+-------
+   100 | again | again
+(1 row)
+
+INSERT INTO d_pk VALUES (5, 'a duplicate');
+ERROR:  duplicate key value violates unique constraint "d_pk_pkey"
+DETAIL:  Key (id)=(5) already exists.
+DROP TABLE d_pk;
+-- an index scan has the entries of a rollback's rows, and of the rows a
+-- commit deleted, marked
+CREATE TABLE d_scan (id int NOT NULL, v text) USING lance;
+CREATE INDEX d_scan_id ON d_scan (id);
+INSERT INTO d_scan VALUES (0, 'committed');
+BEGIN;
+INSERT INTO d_scan SELECT g, 'rolled back' FROM generate_series(1, 100) g;
+ROLLBACK;
+SELECT * FROM entries('d_scan_id');
+ items | dead 
+-------+------
+   101 |    0
+(1 row)
+
+SELECT count(v) FROM d_scan WHERE id BETWEEN 1 AND 100;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_scan_id');
+ items | dead 
+-------+------
+   101 |  100
+(1 row)
+
+DELETE FROM d_scan WHERE id = 0;
+SELECT count(v) FROM d_scan WHERE id = 0;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_scan_id');
+ items | dead 
+-------+------
+   101 |  101
+(1 row)
+
+DROP TABLE d_scan;
+-- a parallel operation cannot tell: its scans go on, and mark nothing
+CREATE TABLE d_par (id int NOT NULL, v text) USING lance;
+CREATE INDEX d_par_id ON d_par (id);
+INSERT INTO d_par VALUES (0, 'committed');
+BEGIN;
+INSERT INTO d_par SELECT g, 'rolled back' FROM generate_series(1, 100) g;
+ROLLBACK;
+SET debug_parallel_query = on;
+EXPLAIN (COSTS OFF) SELECT count(v) FROM d_par WHERE id BETWEEN 1 AND 100;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Gather
+   Workers Planned: 1
+   Single Copy: true
+   ->  Aggregate
+         ->  Index Scan using d_par_id on d_par
+               Index Cond: ((id >= 1) AND (id <= 100))
+(6 rows)
+
+SELECT count(v) FROM d_par WHERE id BETWEEN 1 AND 100;
+ count 
+-------
+     0
+(1 row)
+
+RESET debug_parallel_query;
+SELECT * FROM entries('d_par_id');
+ items | dead 
+-------+------
+   101 |    0
+(1 row)
+
+SELECT count(v) FROM d_par WHERE id BETWEEN 1 AND 100;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_par_id');
+ items | dead 
+-------+------
+   101 |  100
+(1 row)
+
+DROP TABLE d_par;
+-- the rows an old snapshot still reads keep their entries, until it is gone
+CREATE TABLE d_old (id int NOT NULL, v text) USING lance;
+CREATE INDEX d_old_id ON d_old (id);
+INSERT INTO d_old SELECT g, 'x' FROM generate_series(1, 50) g;
+SELECT dblink_exec('other', 'BEGIN ISOLATION LEVEL REPEATABLE READ');
+ dblink_exec 
+-------------
+ BEGIN
+(1 row)
+
+SELECT * FROM dblink('other', 'SELECT count(*) FROM d_old') AS r(n bigint);
+ n  
+----
+ 50
+(1 row)
+
+DELETE FROM d_old WHERE id <= 25;
+SELECT count(v) FROM d_old WHERE id <= 25;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_old_id');
+ items | dead 
+-------+------
+    50 |    0
+(1 row)
+
+SELECT * FROM dblink('other', 'SELECT count(v) FROM d_old WHERE id <= 25') AS r(n bigint);
+ n  
+----
+ 25
+(1 row)
+
+SELECT dblink_exec('other', 'COMMIT');
+ dblink_exec 
+-------------
+ COMMIT
+(1 row)
+
+-- PostgreSQL moves its horizon on when RecentXmin moves: a transaction id spent
+SELECT pg_current_xact_id() IS NOT NULL AS spent;
+ spent 
+-------
+ t
+(1 row)
+
+SELECT count(v) FROM d_old WHERE id <= 25;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_old_id');
+ items | dead 
+-------+------
+    50 |   25
+(1 row)
+
+DROP TABLE d_old;
+-- an open transaction's rows keep their entries: they are there when it
+-- commits, and marked once it has rolled back
+CREATE TABLE d_open (id int NOT NULL, v text) USING lance;
+CREATE INDEX d_open_id ON d_open (id);
+INSERT INTO d_open VALUES (0, 'committed');
+SELECT dblink_exec('other', 'BEGIN');
+ dblink_exec 
+-------------
+ BEGIN
+(1 row)
+
+SELECT dblink_exec('other', 'INSERT INTO d_open SELECT g, ''open'' FROM generate_series(1, 30) g');
+ dblink_exec 
+-------------
+ INSERT 0 30
+(1 row)
+
+SELECT count(v) FROM d_open WHERE id BETWEEN 1 AND 30;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_open_id');
+ items | dead 
+-------+------
+    31 |    0
+(1 row)
+
+SELECT dblink_exec('other', 'COMMIT');
+ dblink_exec 
+-------------
+ COMMIT
+(1 row)
+
+SELECT count(v) FROM d_open WHERE id BETWEEN 1 AND 30;
+ count 
+-------
+    30
+(1 row)
+
+SELECT * FROM entries('d_open_id');
+ items | dead 
+-------+------
+    31 |    0
+(1 row)
+
+SELECT dblink_exec('other', 'BEGIN');
+ dblink_exec 
+-------------
+ BEGIN
+(1 row)
+
+SELECT dblink_exec('other', 'INSERT INTO d_open SELECT g, ''open'' FROM generate_series(31, 60) g');
+ dblink_exec 
+-------------
+ INSERT 0 30
+(1 row)
+
+SELECT count(v) FROM d_open WHERE id BETWEEN 31 AND 60;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_open_id');
+ items | dead 
+-------+------
+    61 |    0
+(1 row)
+
+SELECT dblink_exec('other', 'ROLLBACK');
+ dblink_exec 
+-------------
+ ROLLBACK
+(1 row)
+
+SELECT count(v) FROM d_open WHERE id BETWEEN 31 AND 60;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_open_id');
+ items | dead 
+-------+------
+    61 |   30
+(1 row)
+
+DROP TABLE d_open;
+-- the transaction's own deletions, and its rows under a savepoint rolled
+-- back, are no one else's: no entry marked before it ends
+CREATE TABLE d_own (id int NOT NULL, v text) USING lance;
+CREATE INDEX d_own_id ON d_own (id);
+INSERT INTO d_own SELECT g, 'x' FROM generate_series(1, 20) g;
+BEGIN;
+DELETE FROM d_own WHERE id <= 10;
+SELECT count(v) FROM d_own WHERE id <= 10;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_own_id');
+ items | dead 
+-------+------
+    20 |    0
+(1 row)
+
+ROLLBACK;
+SELECT count(v) FROM d_own WHERE id <= 10;
+ count 
+-------
+    10
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+INSERT INTO d_own SELECT g, 'sub' FROM generate_series(100, 109) g;
+ROLLBACK TO SAVEPOINT s;
+SELECT count(v) FROM d_own WHERE id >= 100;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_own_id');
+ items | dead 
+-------+------
+    30 |    0
+(1 row)
+
+COMMIT;
+SELECT count(v) FROM d_own WHERE id >= 100;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM entries('d_own_id');
+ items | dead 
+-------+------
+    30 |   10
+(1 row)
+
+DROP TABLE d_own;
+-- VACUUM removes the entries of dead rows from the indexes, marked or not
+CREATE TABLE v_pk (id int PRIMARY KEY, v text) USING lance;
+INSERT INTO v_pk VALUES (0, 'committed');
+BEGIN;
+INSERT INTO v_pk SELECT g, 'rolled back' FROM generate_series(1, 100) g;
+ROLLBACK;
+INSERT INTO v_pk SELECT g, 'again' FROM generate_series(1, 100) g;
+SELECT * FROM entries('v_pk_pkey');
+ items | dead 
+-------+------
+   201 |  100
+(1 row)
+
+VACUUM v_pk;
+SELECT * FROM entries('v_pk_pkey');
+ items | dead 
+-------+------
+   101 |    0
+(1 row)
+
+SELECT reltuples FROM pg_class WHERE relname = 'v_pk_pkey';
+ reltuples 
+-----------
+       101
+(1 row)
+
+SELECT count(*), min(v), max(v) FROM v_pk WHERE id BETWEEN 1 AND 100;
+ count |  min  |  max  
+-------+-------+-------
+   100 | again | again
+(1 row)
+
+DELETE FROM v_pk WHERE id <= 50;
+SELECT * FROM entries('v_pk_pkey');
+ items | dead 
+-------+------
+   101 |    0
+(1 row)
+
+VACUUM (INDEX_CLEANUP OFF) v_pk;
+SELECT * FROM entries('v_pk_pkey');
+ items | dead 
+-------+------
+   101 |    0
+(1 row)
+
+VACUUM v_pk;
+SELECT * FROM entries('v_pk_pkey');
+ items | dead 
+-------+------
+    50 |    0
+(1 row)
+
+SELECT count(*) FROM v_pk WHERE id BETWEEN 51 AND 100;
+ count 
+-------
+    50
+(1 row)
+
+INSERT INTO v_pk VALUES (51, 'a duplicate');
+ERROR:  duplicate key value violates unique constraint "v_pk_pkey"
+DETAIL:  Key (id)=(51) already exists.
+INSERT INTO v_pk VALUES (1, 'a key free again');
+DROP TABLE v_pk;
+-- rows updated in place keep their TIDs and entries, until a commit deletes them
+CREATE TABLE v_place (id int PRIMARY KEY, v int) USING lance;
+INSERT INTO v_place SELECT g, g FROM generate_series(1, 40) g;
+UPDATE v_place SET v = v + 1 WHERE id <= 20;
+VACUUM v_place;
+SELECT * FROM entries('v_place_pkey');
+ items | dead 
+-------+------
+    40 |    0
+(1 row)
+
+BEGIN;
+UPDATE v_place SET v = v + 1 WHERE id <= 10;
+DELETE FROM v_place WHERE id <= 5;
+COMMIT;
+VACUUM v_place;
+SELECT * FROM entries('v_place_pkey');
+ items | dead 
+-------+------
+    35 |    0
+(1 row)
+
+SELECT count(*), sum(v) FROM v_place WHERE id > 0;
+ count | sum 
+-------+-----
+    35 | 825
+(1 row)
+
+DROP TABLE v_place;
+-- beside a lance_index, which Lance keeps
+CREATE TABLE v_both (id int NOT NULL, k int) USING lance;
+INSERT INTO v_both SELECT g, g FROM generate_series(1, 20) g;
+CREATE INDEX v_both_id ON v_both (id);
+CREATE INDEX v_both_k ON v_both USING lance_index (k) WITH (type = 'btree');
+DELETE FROM v_both WHERE id <= 5;
+VACUUM v_both;
+SELECT * FROM entries('v_both_id');
+ items | dead 
+-------+------
+    15 |    0
+(1 row)
+
+SELECT count(*) FROM v_both WHERE id > 5;
+ count 
+-------
+    15
+(1 row)
+
+DROP TABLE v_both;
+-- VACUUM leaves the rows an old snapshot still reads
+CREATE TABLE v_old (id int NOT NULL, v text) USING lance;
+CREATE INDEX v_old_id ON v_old (id);
+INSERT INTO v_old SELECT g, 'x' FROM generate_series(1, 50) g;
+SELECT dblink_exec('other', 'BEGIN ISOLATION LEVEL REPEATABLE READ');
+ dblink_exec 
+-------------
+ BEGIN
+(1 row)
+
+SELECT * FROM dblink('other', 'SELECT count(*) FROM v_old') AS r(n bigint);
+ n  
+----
+ 50
+(1 row)
+
+DELETE FROM v_old WHERE id <= 25;
+VACUUM v_old;
+SELECT * FROM entries('v_old_id');
+ items | dead 
+-------+------
+    50 |    0
+(1 row)
+
+SELECT * FROM dblink('other', 'SELECT count(v) FROM v_old WHERE id <= 25') AS r(n bigint);
+ n  
+----
+ 25
+(1 row)
+
+SELECT dblink_exec('other', 'COMMIT');
+ dblink_exec 
+-------------
+ COMMIT
+(1 row)
+
+SELECT pg_current_xact_id() IS NOT NULL AS spent;
+ spent 
+-------
+ t
+(1 row)
+
+VACUUM v_old;
+SELECT * FROM entries('v_old_id');
+ items | dead 
+-------+------
+    25 |    0
+(1 row)
+
+DROP TABLE v_old;
+-- VACUUM leaves an open transaction's rows
+CREATE TABLE v_open (id int NOT NULL, v text) USING lance;
+CREATE INDEX v_open_id ON v_open (id);
+INSERT INTO v_open VALUES (0, 'committed');
+SELECT dblink_exec('other', 'BEGIN');
+ dblink_exec 
+-------------
+ BEGIN
+(1 row)
+
+SELECT dblink_exec('other', 'INSERT INTO v_open SELECT g, ''open'' FROM generate_series(1, 30) g');
+ dblink_exec 
+-------------
+ INSERT 0 30
+(1 row)
+
+VACUUM v_open;
+SELECT * FROM entries('v_open_id');
+ items | dead 
+-------+------
+    31 |    0
+(1 row)
+
+SELECT dblink_exec('other', 'COMMIT');
+ dblink_exec 
+-------------
+ COMMIT
+(1 row)
+
+SELECT count(v) FROM v_open WHERE id BETWEEN 1 AND 30;
+ count 
+-------
+    30
+(1 row)
+
+DROP TABLE v_open;
+-- VACUUM leaves the rows of a transaction that begins and commits once it
+-- has read the row ids, which the version it read has not
+CREATE TABLE v_race (id int NOT NULL, v text) USING lance;
+CREATE INDEX v_race_id ON v_race (id);
+INSERT INTO v_race VALUES (0, 'committed');
+SELECT pg_advisory_lock(424242);
+ pg_advisory_lock 
+------------------
+ 
+(1 row)
+
+SELECT dblink_exec('other', 'SET lance.debug_vacuum_wait = 424242');
+ dblink_exec 
+-------------
+ SET
+(1 row)
+
+SELECT dblink_send_query('other', 'VACUUM v_race');
+ dblink_send_query 
+-------------------
+                 1
+(1 row)
+
+DO $$
+BEGIN
+    WHILE NOT EXISTS (SELECT FROM pg_locks WHERE locktype = 'advisory' AND NOT granted) LOOP
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+END $$;
+INSERT INTO v_race SELECT g, 'new' FROM generate_series(1, 40) g;
+SELECT pg_advisory_unlock(424242);
+ pg_advisory_unlock 
+--------------------
+ t
+(1 row)
+
+SELECT * FROM dblink_get_result('other') AS r(status text);
+ status 
+--------
+ VACUUM
+(1 row)
+
+SELECT * FROM dblink_get_result('other') AS r(status text);
+ status 
+--------
+(0 rows)
+
+SELECT dblink_exec('other', 'RESET lance.debug_vacuum_wait');
+ dblink_exec 
+-------------
+ RESET
+(1 row)
+
+SELECT count(v) FROM v_race WHERE id BETWEEN 1 AND 40;
+ count 
+-------
+    40
+(1 row)
+
+SELECT * FROM entries('v_race_id');
+ items | dead 
+-------+------
+    41 |    0
+(1 row)
+
+DROP TABLE v_race;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET lance.enable_customscan;
+DROP FUNCTION entries(text);
+SELECT dblink_disconnect('other');
+ dblink_disconnect 
+-------------------
+ OK
+(1 row)
+

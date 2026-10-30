@@ -191,6 +191,58 @@ lt_catalog_version(Oid relid, Snapshot snapshot)
 	return version;
 }
 
+/*
+ * Whether every snapshot sees what the transaction committed, as it does
+ * for good once it does: GlobalVis moves on with RecentXmin, which taking a
+ * snapshot brings up to date.
+ */
+bool
+lt_catalog_settled(TransactionId xid)
+{
+	Relation	catrel = table_open(lt_catalog_relid(), AccessShareLock);
+	bool		settled;
+
+	(void) GetLatestSnapshot();
+	settled = GlobalVisCheckRemovableXid(catrel, xid);
+	table_close(catrel, AccessShareLock);
+	return settled;
+}
+
+/*
+ * The latest version the catalog names and the transaction that named it;
+ * the result, whether every snapshot reads that version: its row is frozen,
+ * or that transaction is past every snapshot's horizon.
+ */
+bool
+lt_catalog_latest(Oid relid, uint64 *version, TransactionId *xid)
+{
+	Relation	catrel = table_open(lt_catalog_relid(), AccessShareLock);
+	Snapshot	snapshot = RegisterSnapshot(GetLatestSnapshot());
+	HeapTuple	tup = catalog_fetch(catrel, relid, snapshot);
+	bool		settled = false;
+
+	*version = 0;
+	*xid = InvalidTransactionId;
+	if (HeapTupleIsValid(tup))
+	{
+		bool		isnull;
+		Datum		d = heap_getattr(tup, Anum_tables_version, RelationGetDescr(catrel), &isnull);
+
+		*version = isnull ? 0 : (uint64) DatumGetInt64(d);
+		if (HeapTupleHeaderXminFrozen(tup->t_data))
+			settled = true;
+		else
+		{
+			*xid = HeapTupleHeaderGetRawXmin(tup->t_data);
+			settled = GlobalVisCheckRemovableXid(catrel, *xid);
+		}
+		heap_freetuple(tup);
+	}
+	UnregisterSnapshot(snapshot);
+	table_close(catrel, AccessShareLock);
+	return settled;
+}
+
 /* ------------------------------------------------------------------------
  * The fixed part of a table's row, cached
  * ------------------------------------------------------------------------
@@ -1086,8 +1138,12 @@ take_chunk(void)
 uint64
 lt_next_rowid(void)
 {
-	if (rowid_next >= rowid_end)
+	bool		taken = rowid_next >= rowid_end;
+
+	if (taken)
 		take_chunk();
+	if (taken || !lt_rowids_shown())
+		lt_rowids_show(rowid_next, rowid_end);
 	return rowid_next++;
 }
 

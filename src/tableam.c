@@ -570,7 +570,12 @@ lt_index_fetch_tuple(IndexFetchTableData *scan, ItemPointer tid, Snapshot snapsh
 	if (all_dead)
 		*all_dead = false;
 	if (!fetch_one(scan->rel, tid, snapshot, slot))
+	{
+		/* a row no snapshot will see again: the index marks its entry dead */
+		if (all_dead && lt_tid_valid(tid))
+			*all_dead = lt_rowid_dead(scan->rel, lt_tid_to_rowid(tid), snapshot);
 		return false;
+	}
 	pgstat_count_heap_fetch(scan->rel);
 	return true;
 }
@@ -611,15 +616,19 @@ lt_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapsho
 }
 
 /*
- * An index's entries the table knows dead: none -- a fetch never reports a
- * row dead to every snapshot, so the index marks no entry dead of its own
- * either.  The array keeps the deletable entries alone, as callers rely on
- * (heapam_handler.c's heap_index_delete_tuples).
+ * An index's entries the table knows dead: those the index marked dead, on
+ * a fetch's word that no snapshot will see their rows again (lt_rowid_dead()).
+ * The array keeps the deletable entries alone, as callers rely on
+ * (heapam_handler.c's heap_index_delete_tuples).  A standby's query from
+ * before the commit of the latest version conflicts: their rows were gone by
+ * that commit at the latest.
  */
 static TransactionId
 lt_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
 	int			n = 0;
+	uint64		version;
+	TransactionId xid = InvalidTransactionId;
 
 	for (int i = 0; i < delstate->ndeltids; i++)
 	{
@@ -629,7 +638,9 @@ lt_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 			delstate->deltids[n++] = *d;
 	}
 	delstate->ndeltids = n;
-	return InvalidTransactionId;
+	if (n > 0)
+		(void) lt_catalog_latest(RelationGetRelid(rel), &version, &xid);
+	return xid;
 }
 
 /* ------------------------------------------------------------------------
@@ -1371,6 +1382,10 @@ lt_relation_vacuum(Relation rel, const VacuumParams *params, BufferAccessStrateg
 		return;
 	api = lt_api();
 	memset(&info, 0, sizeof(info));
+
+	/* first: a compaction's version would be this transaction's, not settled */
+	lt_vacuum_indexes(rel, params, bstrategy, elevel);
+
 	if (lt_vacuum_compact)
 	{
 		/* autovacuum passes a table whose commit lock another holds */

@@ -30,9 +30,9 @@ As of 2026-10-30, built and tested against:
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
 - Every leg of `test/run.sh` passes, on both builds: `checks` (the ABI's two
-  declarations agree), `engine`, `suite` (14 files: basic, types, dml,
+  declarations agree), `engine`, `suite` (15 files: basic, types, dml,
   search, indexes, datasets, schema, concurrency, encoding, pushdown,
-  parallel, inplace, fetch, vacuum), `recovery`, `s3` (LocalStack),
+  parallel, inplace, fetch, deadrows, vacuum), `recovery`, `s3` (LocalStack),
   `interop` (pylance), `vexec`.
 - PostgreSQL's own regression suite with `default_table_access_method =
   lance` ran all 239 of its files on 19beta3 with no crash, failed
@@ -330,6 +330,18 @@ small integers on 32 CPUs (0.67 s), where one task with 64 MB took 216 MB
 (0.76 s).  VACUUM leaves `pg_stat_user_tables` and `pg_class` as heap's
 VACUUM does, so that autovacuum counts a table's changes from it.
 
+VACUUM also removes from the table's PostgreSQL indexes the entries of rows
+no snapshot will see again -- the rows of a rollback, the rows a commit
+deleted -- unless `INDEX_CLEANUP OFF` says otherwise; autovacuum does when the
+table has dead rows.  A row is gone for good when the latest version has no
+such row, every snapshot reads that version and no open transaction has
+taken its id.  VACUUM waits up to a second for the transactions at the
+version it read to end, and a longer one holds the entries back as it holds
+back heap's dead tuples.  Until then a fetch through an index that finds such
+a row gone has the index mark its entry dead, and the index removes it when
+its page fills.  Both take the shared memory of `shared_preload_libraries`;
+loaded otherwise, the module leaves the entries where they are.
+
 ### Functions
 
 | | |
@@ -480,6 +492,15 @@ they wait in memory, so that 2,000 rows updated through a btree index take
 0.74 s and write one fragment, where each row wrote a fragment of its own
 and the update took 1.6 s before.
 
+Keys inserted again after a rollback or a committed delete meet the index
+entries of the rows that are gone.  Each uniqueness check fetches such a row
+once, finds it gone and has its entry marked dead, and the index drops the
+entries as its pages fill: a million rows over a primary key take 6.5 s,
+against 0.7 s into an empty table and 21 to 26 s before, and the index stays
+the size of a clean table's (21 MB, where it grew to 64 MB).  A VACUUM that
+finds no dead rows spends about 8 ms a million rows on their row ids and the
+indexes.
+
 ## Limits
 
 - Refused, because the dataset would be left behind the relation: what
@@ -504,7 +525,10 @@ and the update took 1.6 s before.
 - The dataset's files are not WAL-logged: a physical standby reads a
   dataset on shared storage (S3) at the versions the replicated catalog
   names, but has no copy of one on the primary's disk; `pg_basebackup` does
-  not copy a dataset consistently.  `pg_dump` dumps a lance table's rows,
+  not copy a dataset consistently.  VACUUM's removal of index entries is no
+  recovery conflict: a standby's query reading a version older than the
+  primary's latest may miss rows through an index, unless
+  `hot_standby_feedback` holds the primary's horizon back.  `pg_dump` dumps a lance table's rows,
   which restore into a managed table at the default location.
 - Each backend has its own Lance caches: a vector index is read into each
   backend that searches it.

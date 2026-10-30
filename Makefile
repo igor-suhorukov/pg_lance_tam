@@ -15,6 +15,7 @@ OBJS = \
 	src/indexam.o \
 	src/module.o \
 	src/options.o \
+	src/rowids.o \
 	src/scan.o \
 	src/tableam.o \
 	src/vexec.o \

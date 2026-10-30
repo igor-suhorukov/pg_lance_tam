@@ -278,7 +278,10 @@ lt_reader_fill_spec(LtReader *r, LtReadSpec *rs, LeScanSpec *spec, struct ArrowS
 	xt = lt_xact_table_by_relid(RelationGetRelid(r->rel));
 	if (xt && xt->write)
 	{
-		lt_xact_flush(xt);
+		if (r->take_ids)
+			lt_xact_flush_for(xt, r->take_ids, r->ntake_ids);
+		else
+			lt_xact_flush(xt);
 		spec->write = xt->write;
 	}
 	spec->cid = snapshot_cid(r->snapshot);
@@ -589,7 +592,10 @@ take_rows(Relation rel, Snapshot snapshot, uint64 version, bool narrow, const ui
 	r->version = version;
 	r->dataset = lt_open_dataset(r->table, r->version);
 	memset(&types, 0, sizeof(types));
+	r->take_ids = want;
+	r->ntake_ids = n;
 	lt_reader_fill_spec(r, NULL, &spec, &types);
+	r->take_ids = NULL;
 	memset(batch, 0, sizeof(*batch));
 	rc = lt_api()->take(r->dataset, &spec, want, n, &batch->array, &batch->schema, &err);
 	if (types.release)
@@ -781,6 +787,31 @@ window_store(FetchWindow *w, Relation rel, uint64 rowid, TupleTableSlot *slot)
 	/* the values must outlive the window */
 	ExecMaterializeSlot(slot);
 	return true;
+}
+
+/*
+ * Every row id of the version's live rows, given to the function, in the
+ * order of the fragments: reading the narrowest column, as a take that asks
+ * only which rows there are.
+ */
+void
+lt_scan_rowids(Relation rel, uint64 version, void (*fn) (uint64 rowid, void *arg), void *arg)
+{
+	LtReadSpec	rs;
+	LtReader   *r;
+
+	memset(&rs, 0, sizeof(rs));
+	rs.attnums = narrowest_column(lt_layout_build(rel, CurrentMemoryContext));
+	rs.limit = -1;
+	rs.version = version;
+	r = lt_reader_begin(rel, SnapshotAny, &rs);
+	while (lt_reader_next_batch(r))
+	{
+		CHECK_FOR_INTERRUPTS();
+		for (int64 row = 0; row < r->batch.nrows; row++)
+			fn(lt_batch_rowid(&r->batch, row), arg);
+	}
+	lt_reader_end(r);
 }
 
 /*

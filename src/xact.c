@@ -286,6 +286,32 @@ lt_xact_flush(LtXactTable *xt)
 	flush_deletes(xt);
 }
 
+/*
+ * What a take of these rows needs handed to the engine: the batch being
+ * formed and the deletions gathered, when they may hold one of them.  A
+ * uniqueness check of each row inserted over the index entries of dead rows
+ * would otherwise hand over a batch a row.
+ */
+void
+lt_xact_flush_for(LtXactTable *xt, const uint64 *ids, int n)
+{
+	uint64		min = PG_UINT64_MAX;
+	uint64		max = 0;
+
+	if (xt == NULL || xt->write == NULL)
+		return;
+	for (int i = 0; i < n; i++)
+	{
+		min = Min(min, ids[i]);
+		max = Max(max, ids[i]);
+	}
+	if (xt->builder && lt_builder_rows(xt->builder) > 0 &&
+		min <= xt->builder_max && max >= xt->builder_min)
+		flush_builder(xt);
+	if (xt->ndeletes > 0 && min <= xt->deletes_max && max >= xt->deletes_min)
+		flush_deletes(xt);
+}
+
 void
 lt_xact_flush_rel(Relation rel)
 {
@@ -322,6 +348,13 @@ xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid, boo
 	lt_rowid_to_tid(rowid, &slot->tts_tid);
 	slot->tts_tableOid = RelationGetRelid(rel);
 	lt_builder_add(xt->builder, slot, version ? rowid | LE_ROWID_NEW_VERSION : rowid);
+	if (lt_builder_rows(xt->builder) == 1)
+		xt->builder_min = xt->builder_max = rowid;
+	else
+	{
+		xt->builder_min = Min(xt->builder_min, rowid);
+		xt->builder_max = Max(xt->builder_max, rowid);
+	}
 	xt->rows_inserted++;
 	xt->generation++;
 	if (version)
@@ -500,6 +533,13 @@ lt_xact_delete(Relation rel, uint64 rowid, CommandId cid, uint64 version)
 		xt->deletes_cap = cap;
 	}
 	xt->deletes[xt->ndeletes++] = rowid;
+	if (xt->ndeletes == 1)
+		xt->deletes_min = xt->deletes_max = rowid;
+	else
+	{
+		xt->deletes_min = Min(xt->deletes_min, rowid);
+		xt->deletes_max = Max(xt->deletes_max, rowid);
+	}
 	xt->delete_cid = cid;
 	xt->delete_subxid = subxid;
 	xt->delete_version = version;
@@ -1127,6 +1167,7 @@ end_of_xact(bool commit)
 
 	xact_committing = false;
 	lt_scan_reset_readers();
+	lt_rowids_xact_end();
 	if (xact_tables == NULL)
 		return;
 	api = lt_engine_loaded() ? lt_api() : NULL;

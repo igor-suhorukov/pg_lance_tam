@@ -79,6 +79,7 @@ extern bool lt_scan_in_order;
 extern bool lt_vacuum_compact;
 extern int	lt_version_retention;
 extern int	lt_debug_fail_after_commit;
+extern int	lt_debug_vacuum_wait;
 extern bool lt_preloaded;
 
 /* engine.c */
@@ -130,6 +131,8 @@ extern LtTable *lt_table(Relation rel);
 extern LtTable *lt_table_by_relid(Oid relid, bool missing_ok);
 extern LtTable *lt_table_copy_by_relid(Oid relid, bool missing_ok);
 extern uint64 lt_catalog_version(Oid relid, Snapshot snapshot);
+extern bool lt_catalog_settled(TransactionId xid);
+extern bool lt_catalog_latest(Oid relid, uint64 *version, TransactionId *xid);
 extern uint64 lt_snapshot_version(Relation rel, LtTable *t, Snapshot snapshot);
 extern void lt_catalog_insert(Oid relid, const char *uri, uint64 version, bool managed,
 							  bool writable, bool follow, List *columns, List *options,
@@ -342,6 +345,9 @@ typedef struct LtReader
 	uint64		rows_read;
 	uint64		batches_read;
 	bool		done;
+	/* a take's row ids: the transaction's changes they may need, flushed */
+	const uint64 *take_ids;
+	int			ntake_ids;
 	void	   *handles;		/* the engine handles, kept by a resource
 								 * owner */
 } LtReader;
@@ -356,6 +362,8 @@ extern LeDataset *lt_open_dataset(LtTable *t, uint64 version);
 extern bool lt_fetch_rows(Relation rel, Snapshot snapshot, const uint64 *rowids, int n,
 						  TupleTableSlot **slots, bool *found);
 extern bool lt_fetch_visible(Relation rel, Snapshot snapshot, uint64 rowid);
+extern void lt_scan_rowids(Relation rel, uint64 version, void (*fn) (uint64 rowid, void *arg),
+						   void *arg);
 extern char *lt_reader_explain(Relation rel, Snapshot snapshot, LtReadSpec *spec, bool verbose);
 extern void lt_scan_reset_readers(void);
 extern void lt_store_batch_row(LtBatch *batch, int64 row, LtColumn **cols, const int *attidx,
@@ -373,6 +381,8 @@ typedef struct LtXactTable
 	LtBuilder  *builder;		/* rows not yet given to the engine */
 	CommandId	builder_cid;
 	SubTransactionId builder_subxid;
+	uint64		builder_min;	/* the range of the ids in it */
+	uint64		builder_max;
 	uint64		base_version;
 	bool		created;		/* the dataset was made in this transaction */
 	SubTransactionId created_subxid;
@@ -390,6 +400,8 @@ typedef struct LtXactTable
 	uint64	   *deletes;
 	int			ndeletes;
 	int			deletes_cap;
+	uint64		deletes_min;	/* the range of the ids */
+	uint64		deletes_max;
 	CommandId	delete_cid;
 	SubTransactionId delete_subxid;
 	uint64		delete_version; /* the dataset version they were read at */
@@ -417,6 +429,7 @@ extern LtXactTable *lt_xact_table(Relation rel, bool create);
 extern LtXactTable *lt_xact_table_by_relid(Oid relid);
 extern LeWrite *lt_xact_write(Relation rel, LtXactTable *xt);
 extern void lt_xact_flush(LtXactTable *xt);
+extern void lt_xact_flush_for(LtXactTable *xt, const uint64 *ids, int n);
 extern void lt_xact_flush_rel(Relation rel);
 extern void lt_xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid);
 extern void lt_xact_insert_version(Relation rel, TupleTableSlot *slot, CommandId cid,
@@ -434,6 +447,17 @@ extern int	lt_xact_row_state(Relation rel, uint64 rowid, CommandId cid, CommandI
 extern bool lt_xact_row_is_own(Oid relid, uint64 rowid);
 extern uint64 lt_xact_generation(Oid relid);
 extern bool lt_xact_only_appended(Oid relid);
+
+/* rowids.c: the row ids no snapshot will see again */
+extern void lt_rowids_init(void);
+extern bool lt_rowids_shown(void);
+extern void lt_rowids_show(uint64 start, uint64 end);
+extern void lt_rowids_xact_end(void);
+extern bool lt_rowid_dead(Relation rel, uint64 rowid, Snapshot snapshot);
+struct VacuumParams;
+extern void lt_vacuum_indexes(Relation rel, const struct VacuumParams *params,
+							  BufferAccessStrategy bstrategy, int elevel);
+
 extern char *lt_xact_properties(Oid relid);
 extern uint64 lt_commit_base(Oid relid, const char *uri, const char *storage_json,
 							 uint64 catalog_version, const char *props);
