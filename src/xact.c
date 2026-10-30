@@ -323,6 +323,9 @@ xact_insert(Relation rel, TupleTableSlot *slot, CommandId cid, uint64 rowid, boo
 	slot->tts_tableOid = RelationGetRelid(rel);
 	lt_builder_add(xt->builder, slot, version ? rowid | LE_ROWID_NEW_VERSION : rowid);
 	xt->rows_inserted++;
+	xt->generation++;
+	if (version)
+		xt->rows_changed = true;
 	if (lt_builder_rows(xt->builder) >= lt_batch_rows ||
 		lt_builder_bytes(xt->builder) >= (Size) 64 * 1024 * 1024)
 		flush_builder(xt);
@@ -444,6 +447,31 @@ lt_xact_row_is_own(Oid relid, uint64 rowid)
 }
 
 /*
+ * A count of the transaction's changes to the table: a fetch window taken
+ * at one answers for the rows as they were then (scan.c).
+ */
+uint64
+lt_xact_generation(Oid relid)
+{
+	LtXactTable *xt = lt_xact_table_by_relid(relid);
+
+	return xt ? xt->generation : 0;
+}
+
+/*
+ * Whether the transaction has done no more to the table than append rows:
+ * then SnapshotAny and SnapshotSelf see the same rows of it, at one
+ * version -- no row of its is deleted, truncated or a version of another.
+ */
+bool
+lt_xact_only_appended(Oid relid)
+{
+	LtXactTable *xt = lt_xact_table_by_relid(relid);
+
+	return xt == NULL || (!xt->truncated && !xt->rows_changed);
+}
+
+/*
  * A row deleted, the version of it the command sees; "version" is the
  * dataset version the command read the table at, 0 when unknown.
  */
@@ -476,6 +504,8 @@ lt_xact_delete(Relation rel, uint64 rowid, CommandId cid, uint64 version)
 	xt->delete_subxid = subxid;
 	xt->delete_version = version;
 	xt->rows_deleted++;
+	xt->rows_changed = true;
+	xt->generation++;
 	cmd_note_deleted(xt, rowid, cid);
 	if (xt->ndeletes >= DELETE_FLUSH_ROWS)
 		flush_deletes(xt);
@@ -793,6 +823,7 @@ column_change_done(LtXactTable *xt, Oid relid, uint64 base, uint64 new_version, 
 		xt->version_before = base;
 	xt->published = true;
 	xt->published_version = new_version;
+	xt->generation++;
 	lt_catalog_set_version(relid, new_version);
 	lt_catalog_set_columns(relid, columns);
 }
@@ -1081,6 +1112,7 @@ lt_xact_truncate_committed(Relation rel)
 		lt_raise(&err, "truncating a lance table at commit");
 
 	xt->published_version = new_version;
+	xt->generation++;
 	PushActiveSnapshot(GetTransactionSnapshot());
 	lt_catalog_set_version(xt->relid, new_version);
 	PopActiveSnapshot();
@@ -1200,6 +1232,7 @@ lt_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			lt_xact_flush(xt);
 			continue;
 		}
+		xt->generation++;
 		if (event == SUBXACT_EVENT_ABORT_SUB)
 		{
 			/* the rows the subtransaction formed and deleted go with it */

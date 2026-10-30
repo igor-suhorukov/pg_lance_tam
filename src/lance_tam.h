@@ -65,6 +65,7 @@ extern int	lt_index_cache_mb;
 extern int	lt_metadata_cache_mb;
 extern int	lt_batch_rows;
 extern int	lt_readahead;
+extern int	lt_fetch_ahead;
 extern int	lt_buffer_rows;
 extern int	lt_nprobes;
 extern int	lt_ef;
@@ -354,6 +355,7 @@ extern void lt_reader_fill_spec(LtReader *r, LtReadSpec *spec, LeScanSpec *out,
 extern LeDataset *lt_open_dataset(LtTable *t, uint64 version);
 extern bool lt_fetch_rows(Relation rel, Snapshot snapshot, const uint64 *rowids, int n,
 						  TupleTableSlot **slots, bool *found);
+extern bool lt_fetch_visible(Relation rel, Snapshot snapshot, uint64 rowid);
 extern char *lt_reader_explain(Relation rel, Snapshot snapshot, LtReadSpec *spec, bool verbose);
 extern void lt_scan_reset_readers(void);
 extern void lt_store_batch_row(LtBatch *batch, int64 row, LtColumn **cols, const int *attidx,
@@ -404,6 +406,10 @@ typedef struct LtXactTable
 	int64		rows_inserted;
 	int64		rows_deleted;
 	bool		truncated;		/* the version's rows are gone */
+	/* a row deleted or updated in place: more than rows appended */
+	bool		rows_changed;
+	/* the changes to the table, counted for the fetch windows (scan.c) */
+	uint64		generation;
 } LtXactTable;
 
 extern void lt_xact_init(void);
@@ -426,6 +432,8 @@ extern void lt_xact_drop_columns(Oid relid, List *attnums);
 extern void lt_xact_truncate_committed(Relation rel);
 extern int	lt_xact_row_state(Relation rel, uint64 rowid, CommandId cid, CommandId *dcid);
 extern bool lt_xact_row_is_own(Oid relid, uint64 rowid);
+extern uint64 lt_xact_generation(Oid relid);
+extern bool lt_xact_only_appended(Oid relid);
 extern char *lt_xact_properties(Oid relid);
 extern uint64 lt_commit_base(Oid relid, const char *uri, const char *storage_json,
 							 uint64 catalog_version, const char *props);

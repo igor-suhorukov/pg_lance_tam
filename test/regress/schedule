@@ -10,4 +10,5 @@ test: encoding
 test: pushdown
 test: parallel
 test: inplace
+test: fetch
 test: vacuum

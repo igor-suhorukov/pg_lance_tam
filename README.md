@@ -30,10 +30,10 @@ As of 2026-10-30, built and tested against:
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
 - Every leg of `test/run.sh` passes, on both builds: `checks` (the ABI's two
-  declarations agree), `engine`, `suite` (13 files: basic, types, dml,
+  declarations agree), `engine`, `suite` (14 files: basic, types, dml,
   search, indexes, datasets, schema, concurrency, encoding, pushdown,
-  parallel, inplace, vacuum), `recovery`, `s3` (LocalStack), `interop`
-  (pylance), `vexec`.
+  parallel, inplace, fetch, vacuum), `recovery`, `s3` (LocalStack),
+  `interop` (pylance), `vexec`.
 - PostgreSQL's own regression suite with `default_table_access_method =
   lance` ran all 239 of its files on 19beta3 with no crash, failed
   assertion or PANIC.  116 files differ from heap's expected output (160
@@ -354,6 +354,7 @@ VACUUM does, so that autovacuum counts a table's changes from it.
 | `lance.worker_threads` | 4 | a backend's engine threads |
 | `lance.index_cache_mb`, `lance.metadata_cache_mb` | 512, 128 | a backend's Lance caches |
 | `lance.batch_rows`, `lance.readahead` | 8192, 4 | a scan's batches, and how many are decoded ahead |
+| `lance.fetch_ahead` | 1024 | rows a fetch by TID takes ahead when TIDs come in order, as an AFTER trigger's and a foreign key's check of each row a statement wrote do |
 | `lance.buffer_rows` | 131072 | rows held before a fragment is written |
 | `lance.nprobes`, `lance.ef`, `lance.refine_factor` | Lance's | vector search |
 | `lance.enable_customscan`, `lance.enable_ann`, `lance.enable_filter_pushdown` | on | LanceScan, its searches, its filters |
@@ -461,6 +462,17 @@ are pgvector's.
 
 A search through a vector index is slower than pgvector's HNSW because each
 Lance scan costs about a millisecond to set up.
+
+A foreign key on a lance table checks each row a statement writes by
+fetching the row by its TID.  A fetch by TID is a Lance take of about 0.1
+ms, so fetches that come in the order of their TIDs, as these do, are
+served from a window of up to 1,024 rows taken ahead (`lance.fetch_ahead`),
+and the check that the row is still there reads no values.  Inserting rows
+that reference a heap table's key costs about 4 µs a row for the check,
+where heap's costs 1.3 µs: 100,000 rows in 0.42 s, a million in 5.4 s (0.3
+to 0.55 ms a row before).  A load of many millions of rows is faster still
+with the key added after it, `NOT VALID` and then `VALIDATE CONSTRAINT`,
+which checks every row with one join.
 
 ## Limits
 

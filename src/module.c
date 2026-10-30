@@ -37,6 +37,7 @@ int			lt_index_cache_mb = 512;
 int			lt_metadata_cache_mb = 128;
 int			lt_batch_rows = 8192;
 int			lt_readahead = 4;
+int			lt_fetch_ahead = 1024;
 int			lt_buffer_rows = 131072;
 int			lt_nprobes = 0;
 int			lt_ef = 0;
@@ -86,6 +87,10 @@ _PG_init(void)
 	DefineCustomIntVariable("lance.readahead",
 							"Batches a scan decodes ahead of the executor.",
 							NULL, &lt_readahead, 4, 1, 64, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("lance.fetch_ahead",
+							"Rows a fetch by TID takes ahead when a table's rows are fetched in the order of their TIDs, as AFTER triggers and foreign keys' checks fetch them.",
+							"0: none; at most lance.batch_rows.",
+							&lt_fetch_ahead, 1024, 0, 1048576, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("lance.buffer_rows",
 							"Rows a transaction's writes hold in memory before they are written as a fragment.",
 							NULL, &lt_buffer_rows, 131072, 1024, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);

@@ -525,12 +525,10 @@ static Oid	last_fetch_relid = InvalidOid;
 static uint64 last_fetch_rowid = 0;
 static bool last_fetch_newest = false;
 
-static bool
-fetch_one(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
+/* A fetch of the TID by the snapshot, noted as the backend's last */
+static void
+note_fetch(Relation rel, ItemPointer tid, Snapshot snapshot)
 {
-	uint64		rowid;
-	bool		found = false;
-
 	last_fetch_relid = RelationGetRelid(rel);
 	last_fetch_rowid = lt_tid_valid(tid) ? lt_tid_to_rowid(tid) : 0;
 	last_fetch_newest = snapshot == NULL || !IsMVCCSnapshot(snapshot);
@@ -546,6 +544,15 @@ fetch_one(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot
 		snapshot->xmax = InvalidTransactionId;
 		snapshot->speculativeToken = 0;
 	}
+}
+
+static bool
+fetch_one(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
+{
+	uint64		rowid;
+	bool		found = false;
+
+	note_fetch(rel, tid, snapshot);
 	if (!lt_tid_valid(tid))
 		return false;
 	rowid = lt_tid_to_rowid(tid);
@@ -589,14 +596,18 @@ lt_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 	 */
 }
 
+/*
+ * Whether the snapshot sees the row the slot holds, as a fetch of its TID
+ * would find it -- a foreign key's check asks it of each row its AFTER
+ * trigger fetched -- without its values (lt_fetch_visible()).
+ */
 static bool
 lt_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapshot)
 {
-	TupleTableSlot *probe = MakeSingleTupleTableSlot(RelationGetDescr(rel), lt_slot_ops_of());
-	bool		found = fetch_one(rel, &slot->tts_tid, snapshot, probe);
-
-	ExecDropSingleTupleTableSlot(probe);
-	return found;
+	note_fetch(rel, &slot->tts_tid, snapshot);
+	if (!lt_tid_valid(&slot->tts_tid))
+		return false;
+	return lt_fetch_visible(rel, snapshot, lt_tid_to_rowid(&slot->tts_tid));
 }
 
 /*
@@ -1125,6 +1136,7 @@ lt_relation_set_new_filelocator(Relation rel, const RelFileLocator *newrlocator,
 			lt_raise(&err, "truncating a lance table");
 		xt->truncated = true;
 		xt->rows_inserted = xt->rows_deleted = 0;
+		xt->generation++;
 		return;
 	}
 	create_table_dataset(rel);
@@ -1150,6 +1162,7 @@ lt_relation_nontransactional_truncate(Relation rel)
 		lt_raise(&err, "truncating a lance table");
 	xt->truncated = true;
 	xt->rows_inserted = xt->rows_deleted = 0;
+	xt->generation++;
 }
 
 /* SET TABLESPACE: the empty main fork at its new place; the dataset stays */
