@@ -28,7 +28,7 @@ use crate::rt::run;
 use crate::scan::{LeScan, ScanSpec};
 use crate::write::{LeWrite, RowState, Spec};
 
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 
 static LIBRARY_VERSION: LazyLock<CString> = LazyLock::new(|| {
     CString::new(format!(
@@ -120,7 +120,7 @@ unsafe extern "C" fn le_dataset_info(ds: *mut LeDataset, out: *mut LeDatasetInfo
             let d = dataset_ref(ds)?;
             let i = dataset::info(&d.ds);
             let handle = d.ds.clone();
-            let max_row_id = run(async move { dataset::max_row_id(&handle).await })?;
+            let (max_row_id, _) = run(async move { dataset::row_ids_held(&handle, 0, 0).await })?;
             *out = LeDatasetInfo {
                 version: i.version,
                 num_rows: i.num_rows,
@@ -132,6 +132,25 @@ unsafe extern "C" fn le_dataset_info(ds: *mut LeDataset, out: *mut LeDatasetInfo
                 stable_row_ids: i.stable_row_ids,
                 timestamp_us: i.timestamp_us,
             };
+            Ok(())
+        })
+    }
+}
+
+unsafe extern "C" fn le_row_ids_held(
+    ds: *mut LeDataset,
+    lo: u64,
+    hi: u64,
+    max_row_id: *mut u64,
+    held: *mut bool,
+    err: *mut LeError,
+) -> i32 {
+    unsafe {
+        guard(err, || {
+            let handle = dataset_ref(ds)?.ds.clone();
+            let (max, h) = run(async move { dataset::row_ids_held(&handle, lo, hi).await })?;
+            *max_row_id = max;
+            *held = h;
             Ok(())
         })
     }
@@ -807,6 +826,73 @@ unsafe extern "C" fn le_cleanup(
     }
 }
 
+/// Compaction's new fragments, written and not committed (maint::Compaction).
+pub struct LeCompaction {
+    inner: Arc<tokio::sync::Mutex<maint::Compaction>>,
+}
+
+unsafe extern "C" fn le_compact_prepare(
+    ds: *mut LeDataset,
+    options: *const c_char,
+    out: *mut *mut LeCompaction,
+    err: *mut LeError,
+) -> i32 {
+    unsafe {
+        guard(err, || {
+            let d = dataset_ref(ds)?.ds.clone();
+            let opts = opt_str(options)?.map(str::to_string);
+            let c = run(async move { maint::compact_prepare(d, opts.as_deref()).await })?;
+            *out = match c {
+                Some(c) => Box::into_raw(Box::new(LeCompaction {
+                    inner: Arc::new(tokio::sync::Mutex::new(c)),
+                })),
+                None => std::ptr::null_mut(),
+            };
+            Ok(())
+        })
+    }
+}
+
+unsafe extern "C" fn le_compact_commit(
+    c: *mut LeCompaction,
+    latest: *mut LeDataset,
+    new_version: *mut u64,
+    result: *mut *mut c_char,
+    err: *mut LeError,
+) -> i32 {
+    unsafe {
+        guard(err, || {
+            if c.is_null() {
+                return Err(EngineError::invalid("the compaction handle is NULL"));
+            }
+            let inner = (*c).inner.clone();
+            let latest = dataset_ref(latest)?.ds.clone();
+            let (v, json) = run(async move { maint::compact_commit(&mut *inner.lock().await, latest).await })?;
+            *new_version = v;
+            if !result.is_null() {
+                *result = into_c_string(json);
+            }
+            Ok(())
+        })
+    }
+}
+
+unsafe extern "C" fn le_compact_free(c: *mut LeCompaction, cleanup: bool) {
+    if c.is_null() {
+        return;
+    }
+    guard_void(|| {
+        let lc = unsafe { Box::from_raw(c) };
+        if cleanup {
+            let inner = lc.inner.clone();
+            let _ = run(async move {
+                maint::compact_cleanup(&mut *inner.lock().await).await;
+                Ok(())
+            });
+        }
+    });
+}
+
 #[repr(C)]
 pub struct LeApi {
     abi_version: u32,
@@ -917,6 +1003,11 @@ pub struct LeApi {
     ) -> i32,
     write_delete_read:
         unsafe extern "C" fn(*mut LeWrite, *const u64, i64, u64, i64, u32, *mut LeError) -> i32,
+    row_ids_held: unsafe extern "C" fn(*mut LeDataset, u64, u64, *mut u64, *mut bool, *mut LeError) -> i32,
+    compact_prepare: unsafe extern "C" fn(*mut LeDataset, *const c_char, *mut *mut LeCompaction, *mut LeError) -> i32,
+    compact_commit:
+        unsafe extern "C" fn(*mut LeCompaction, *mut LeDataset, *mut u64, *mut *mut c_char, *mut LeError) -> i32,
+    compact_free: unsafe extern "C" fn(*mut LeCompaction, bool),
 }
 
 // SAFETY: the table holds function pointers and a pointer to a static string.
@@ -966,6 +1057,10 @@ static API: LazyLock<LeApi> = LazyLock::new(|| LeApi {
     add_columns: le_add_columns,
     drop_columns: le_drop_columns,
     write_delete_read: le_write_delete_read,
+    row_ids_held: le_row_ids_held,
+    compact_prepare: le_compact_prepare,
+    compact_commit: le_compact_commit,
+    compact_free: le_compact_free,
 });
 
 /// The table of entry points, or NULL when the caller was built for

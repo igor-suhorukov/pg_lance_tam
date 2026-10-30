@@ -232,8 +232,8 @@ Datum
 lance_optimize(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
-	char	   *options = PG_ARGISNULL(1) ? NULL :
-		DatumGetCString(DirectFunctionCall1(jsonb_out, PG_GETARG_DATUM(1)));
+	Datum		bounds = DirectFunctionCall1(jsonb_in, CStringGetDatum(lt_compaction_bounds(0)));
+	char	   *options;
 	Relation	rel = open_lance(relid, ShareUpdateExclusiveLock);
 	LtTable    *t = lt_table(rel);
 	char	   *props;
@@ -251,6 +251,10 @@ lance_optimize(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("lance table \"%s\" is read-only", RelationGetRelationName(rel))));
 	PreventInTransactionBlock(true, "lance.optimize()");
+	/* VACUUM's bounds of compaction, unless the options say otherwise */
+	options = DatumGetCString(DirectFunctionCall1(jsonb_out, PG_ARGISNULL(1) ? bounds :
+												  DirectFunctionCall2(jsonb_concat, bounds,
+																	  PG_GETARG_DATUM(1))));
 	lt_lock_table_commit(relid);
 	props = lt_xact_properties(relid);
 	version = lt_commit_base(relid, t->uri, t->storage_json,

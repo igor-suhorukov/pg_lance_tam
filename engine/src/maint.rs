@@ -3,10 +3,15 @@
 
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
-use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::index::DatasetIndexRemapperOptions;
+use lance::dataset::optimize::{
+    CompactionMetrics, CompactionOptions, RewriteResult, commit_compaction, plan_compaction,
+};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::IndexParams;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
@@ -16,10 +21,12 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_linalg::distance::DistanceType;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::rowids::read_row_ids;
 use serde_json::{Map, Value};
 
-use crate::error::{EResult, EngineError};
+use crate::error::{EResult, EngineError, LE_ERR_CONFLICT};
+use crate::write::row_id_meta;
 
 fn get_usize(p: &Map<String, Value>, key: &str) -> EResult<Option<usize>> {
     match p.get(key) {
@@ -200,19 +207,19 @@ pub async fn build_index(
     Ok(builder.execute_uncommitted().await?)
 }
 
-/// Compaction, then the indices brought up to the new fragments; each a
-/// version of its own.  Returns the last version and what was done.
-pub async fn optimize(base: Arc<Dataset>, options: Option<&str>) -> EResult<(u64, String)> {
-    let p: Map<String, Value> = match options {
+fn options_object(options: Option<&str>) -> EResult<Map<String, Value>> {
+    match options {
         Some(j) if !j.trim().is_empty() => match serde_json::from_str::<Value>(j)? {
-            Value::Object(m) => m,
-            _ => return Err(EngineError::invalid("optimize options must be a JSON object")),
+            Value::Object(m) => Ok(m),
+            _ => Err(EngineError::invalid("optimize options must be a JSON object")),
         },
-        _ => Map::new(),
-    };
-    let mut ds = base.as_ref().clone();
+        _ => Ok(Map::new()),
+    }
+}
+
+fn compaction_options(p: &Map<String, Value>) -> EResult<CompactionOptions> {
     let mut compaction = CompactionOptions::default();
-    if let Some(n) = get_usize(&p, "target_rows_per_fragment")? {
+    if let Some(n) = get_usize(p, "target_rows_per_fragment")? {
         compaction.target_rows_per_fragment = n;
     }
     if let Some(Value::Bool(b)) = p.get("materialize_deletions") {
@@ -221,15 +228,48 @@ pub async fn optimize(base: Arc<Dataset>, options: Option<&str>) -> EResult<(u64
     if let Some(n) = p.get("materialize_deletions_threshold").and_then(|v| v.as_f64()) {
         compaction.materialize_deletions_threshold = n as f32;
     }
-    let compact = !matches!(p.get("compact"), Some(Value::Bool(false)));
+    // what a run may use: its rewrite tasks at once, each one's batches and
+    // the bytes its scan reads ahead (0 would be Lance's unbounded), and
+    // how much of the dataset it takes on
+    if let Some(n) = get_usize(p, "num_threads")? {
+        compaction.num_threads = Some(n.max(1));
+    }
+    if let Some(n) = get_usize(p, "batch_size")? {
+        compaction.batch_size = Some(n.max(1));
+    }
+    if let Some(n) = get_usize(p, "io_buffer_size")? {
+        compaction.io_buffer_size = Some(n.max(1) as u64);
+    }
+    if let Some(n) = get_usize(p, "max_source_fragments")? {
+        compaction.max_source_fragments = Some(n);
+    }
+    if let Some(n) = get_usize(p, "max_source_rows")? {
+        compaction.max_source_rows = Some(n);
+    }
+    if let Some(n) = get_usize(p, "max_source_bytes")? {
+        compaction.max_source_bytes = Some(n as u64);
+    }
+    Ok(compaction)
+}
+
+fn note_metrics(result: &mut Value, metrics: &CompactionMetrics) {
+    result["fragments_removed"] = metrics.fragments_removed.into();
+    result["fragments_added"] = metrics.fragments_added.into();
+    result["files_removed"] = metrics.files_removed.into();
+    result["files_added"] = metrics.files_added.into();
+}
+
+/// Compaction, then the indices brought up to the new fragments; each a
+/// version of its own.  Returns the last version and what was done.
+pub async fn optimize(base: Arc<Dataset>, options: Option<&str>) -> EResult<(u64, String)> {
+    let p = options_object(options)?;
+    let mut ds = base.as_ref().clone();
     let indices = !matches!(p.get("indices"), Some(Value::Bool(false)));
     let mut result = serde_json::json!({});
-    if compact {
-        let metrics = compact_files(&mut ds, compaction, None).await?;
-        result["fragments_removed"] = metrics.fragments_removed.into();
-        result["fragments_added"] = metrics.fragments_added.into();
-        result["files_removed"] = metrics.files_removed.into();
-        result["files_added"] = metrics.files_added.into();
+    if let Some(mut c) = compact_prepare(base.clone(), options).await? {
+        let (committed, metrics) = commit(&mut c, base).await?;
+        note_metrics(&mut result, &metrics);
+        ds = committed;
     }
     if indices && !ds.load_indices().await?.is_empty() {
         ds.optimize_indices(&OptimizeOptions::default()).await?;
@@ -237,6 +277,131 @@ pub async fn optimize(base: Arc<Dataset>, options: Option<&str>) -> EResult<(u64
     }
     result["version"] = ds.version_id().into();
     Ok((ds.version_id(), serde_json::to_string(&result)?))
+}
+
+/// Compaction's new fragments, written on a version and not committed: the
+/// rewrite, which takes long, apart from the commit, which a writer of the
+/// table waits for.
+pub struct Compaction {
+    base: Arc<Dataset>,
+    options: CompactionOptions,
+    results: Vec<RewriteResult>,
+}
+
+/// Compaction as optimize() makes it, planned on `base` and its tasks run,
+/// `num_threads` at once, without its commit; None when it has nothing to
+/// do.
+pub async fn compact_prepare(base: Arc<Dataset>, options: Option<&str>) -> EResult<Option<Compaction>> {
+    let p = options_object(options)?;
+    if matches!(p.get("compact"), Some(Value::Bool(false))) {
+        return Ok(None);
+    }
+    let options = compaction_options(&p)?;
+    let plan = plan_compaction(&base, &options).await?;
+    if plan.num_tasks() == 0 {
+        return Ok(None);
+    }
+    let threads = options.num_threads.unwrap_or_else(get_num_compute_intensive_cpus);
+    let ds = base.as_ref();
+    let mut results: Vec<RewriteResult> = futures::stream::iter(plan.compaction_tasks())
+        .map(|task| async move { task.execute(ds).await })
+        .buffer_unordered(threads)
+        .try_collect()
+        .await?;
+    for f in results.iter_mut().flat_map(|r| r.new_fragments.iter_mut()) {
+        reencode_row_ids(f)?;
+    }
+    Ok(Some(Compaction {
+        base,
+        options,
+        results,
+    }))
+}
+
+/// A new fragment's row ids in the encoding the server writes them in
+/// (`row_id_meta()` in write.rs, which says why), where smaller: Lance
+/// makes the part of a fragment it cuts at a new fragment's bound one
+/// segment, a bitmap of its span where writers interleaved their chunks of
+/// ids, which the manifest and the commit's transaction would both keep.
+fn reencode_row_ids(f: &mut Fragment) -> EResult<()> {
+    let Some(RowIdMeta::Inline(data)) = &f.row_id_meta else {
+        return Ok(());
+    };
+    let ids: Vec<u64> = read_row_ids(data)?.iter().collect();
+    let meta = row_id_meta(&ids);
+    if let RowIdMeta::Inline(new) = &meta
+        && new.len() < data.len()
+    {
+        f.row_id_meta = Some(meta);
+    }
+    Ok(())
+}
+
+/// The compaction committed on `latest`, the newest version, at or after
+/// the one it was written on: Lance refuses it, as a conflict, when a
+/// commit since then deleted rows of a fragment it replaces, and its files
+/// are removed -- not after another failure, which may have come once its
+/// version was published.  Returns the version and what was done.
+pub async fn compact_commit(c: &mut Compaction, latest: Arc<Dataset>) -> EResult<(u64, String)> {
+    let (ds, metrics) = commit(c, latest).await?;
+    let mut result = serde_json::json!({});
+    note_metrics(&mut result, &metrics);
+    result["version"] = ds.version_id().into();
+    Ok((ds.version_id(), serde_json::to_string(&result)?))
+}
+
+async fn commit(c: &mut Compaction, latest: Arc<Dataset>) -> EResult<(Dataset, CompactionMetrics)> {
+    let results = std::mem::take(&mut c.results);
+    if results.is_empty() {
+        return Err(EngineError::invalid("the compaction has no files to commit"));
+    }
+    let added = written(&results);
+    let mut ds = latest.as_ref().clone();
+    match commit_compaction(
+        &mut ds,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &c.options,
+    )
+    .await
+    {
+        Ok(metrics) => Ok((ds, metrics)),
+        Err(e) => {
+            let e = EngineError::from(e);
+            if e.code == LE_ERR_CONFLICT {
+                remove(&c.base, added).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The files the compaction wrote and did not commit, removed.
+pub async fn compact_cleanup(c: &mut Compaction) {
+    let results = std::mem::take(&mut c.results);
+    remove(&c.base, written(&results)).await;
+}
+
+fn written(results: &[RewriteResult]) -> Vec<String> {
+    results
+        .iter()
+        .flat_map(|r| r.new_fragments.iter())
+        .flat_map(|f| f.files.iter())
+        .map(|f| f.path.clone())
+        .collect()
+}
+
+async fn remove(base: &Dataset, files: Vec<String>) {
+    if files.is_empty() {
+        return;
+    }
+    let Ok(store) = base.object_store(None).await else {
+        return;
+    };
+    let dir = base.data_dir();
+    for f in files {
+        let _ = store.delete(&object_store::path::Path::from(format!("{dir}/{f}"))).await;
+    }
 }
 
 pub async fn cleanup(base: Arc<Dataset>, older_than_seconds: i64) -> EResult<String> {

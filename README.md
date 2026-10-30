@@ -19,21 +19,21 @@ and works all the same.
 
 ## Status
 
-As of 2026-10-27, built and tested against:
+As of 2026-10-30, built and tested against:
 
 | | |
 |---|---|
 | PostgreSQL | 19rc1: PGDG's packages (`19~rc1-1.pgdg13+1`) in Docker Hub's `postgres:19rc1-trixie`, without assertions -- the build PostGIS's 19rc1 image runs -- and the same release built from source with assertions (`lance_tam/dev:19rc1-assert`) |
 | Lance | Rust crates `14.0.0-beta.19` (checkout at `dc53d5d`), linked from the checkout |
 | pgvector | 0.8.7 |
-| pylance | 14.0.0, for the interop leg |
+| pylance | 14.0.2, for the interop leg |
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
 - Every leg of `test/run.sh` passes, on both builds: `checks` (the ABI's two
-  declarations agree), `engine`, `suite` (12 files: basic, types, dml,
+  declarations agree), `engine`, `suite` (13 files: basic, types, dml,
   search, indexes, datasets, schema, concurrency, encoding, pushdown,
-  parallel, inplace), `recovery`, `s3` (LocalStack), `interop` (pylance),
-  `vexec`.
+  parallel, inplace, vacuum), `recovery`, `s3` (LocalStack), `interop`
+  (pylance), `vexec`.
 - PostgreSQL's own regression suite with `default_table_access_method =
   lance` ran all 239 of its files on 19beta3 with no crash, failed
   assertion or PANIC.  116 files differ from heap's expected output (160
@@ -43,7 +43,8 @@ As of 2026-10-27, built and tested against:
   [Transactions](#transactions-and-concurrency) and [Limits](#limits).
 - On 19rc1, PGDG's build and the build with assertions alike, all 239
   files run with no crash, failed assertion or PANIC, and the same 117
-  differ, the one more than on 19beta3 a new check of `sqljson_queryfuncs`
+  differ (PGDG's build again on 2026-10-30, `vacuum.sql` nearer heap's
+  output now that VACUUM reports to the statistics), the one more than on 19beta3 a new check of `sqljson_queryfuncs`
   that counts TOAST chunks, which lance tables have none of.  A check new
   to `foreign_key.sql` -- an equality function that updates the
   referenced row while the foreign key's check holds the unique index's
@@ -91,7 +92,9 @@ As of 2026-10-27, built and tested against:
   type changes that convert no values are kept.
 - **ANALYZE and VACUUM**: ANALYZE samples the dataset; VACUUM and
   autovacuum compact it, bring its indexes up to its new rows and remove
-  old versions.
+  old versions -- the compaction written while the table's writers commit,
+  with the parallelism and memory PostgreSQL gives VACUUM -- and leave the
+  table's statistics as heap's VACUUM does.
 - **pg_vexec**, when preloaded: vexec's scans read Lance's Arrow columns
   without copies where they can, and its inserts write batches.
 
@@ -303,6 +306,30 @@ faster than the Parallel Seq Scan the planner took before, and as fast
 reading most of them; with Lance's filter, 6 to 15 times.  A point lookup
 gains little: Lance's filter already runs on its threads.
 
+### VACUUM
+
+VACUUM and autovacuum compact a table's dataset -- small fragments into
+fragments of a million rows, deletions materialized -- bring its Lance
+indexes up to its new rows and remove versions older than
+`lance.version_retention`.  The compaction is written on the version the
+catalog names without the table's commit lock, so that the table's writers
+keep committing; the lock is taken for its commit alone, which Lance
+refuses when a writer has deleted rows it rewrote meanwhile -- the
+compaction is then left for the next VACUUM.  Autovacuum passes a table
+whose lock another holds, and gives its commit up after 5 s.
+
+Compaction is bounded as PostgreSQL bounds VACUUM: its rewrite tasks run
+at once one and the parallel workers VACUUM may have -- `PARALLEL n`, else
+`max_parallel_maintenance_workers`; for autovacuum the table's
+`autovacuum_parallel_workers`, else `autovacuum_max_parallel_workers`, 0
+by default -- and their scans read ahead `maintenance_work_mem`
+(autovacuum's `autovacuum_work_mem`) between them, in batches of
+`lance.batch_rows`.  Lance's own default, a task per CPU with 2 GiB of
+read-ahead each, took a backend to 949 MB compacting 30 million rows of six
+small integers on 32 CPUs (0.67 s), where one task with 64 MB took 216 MB
+(0.76 s).  VACUUM leaves `pg_stat_user_tables` and `pg_class` as heap's
+VACUUM does, so that autovacuum counts a table's changes from it.
+
 ### Functions
 
 | | |
@@ -311,7 +338,7 @@ gains little: Lance's filter already runs on its threads.
 | `lance.schema(rel)` | jsonb: the dataset's fields, each with its Arrow format, nullability, metadata and children |
 | `lance.versions(rel)` | the dataset's versions: version, timestamp, metadata |
 | `lance.indices(rel)`, `lance.fragments(rel)` | jsonb; an index's `rows` are the live rows of the fragments it covers |
-| `lance.optimize(rel, options)` | compaction and index optimization now (`target_rows_per_fragment`, `materialize_deletions`, `compact`, `indices`) |
+| `lance.optimize(rel, options)` | compaction and index optimization now, bounded as VACUUM's unless the options say otherwise (`target_rows_per_fragment`, `materialize_deletions`, `compact`, `indices`, `num_threads`, `io_buffer_size`, `batch_size`, `max_source_rows`, `max_source_fragments`, `max_source_bytes`) |
 | `lance.cleanup(rel, older_than)` | Lance's removal of old versions |
 | `lance.refresh(rel)` | the table becomes its dataset's latest version |
 | `lance.explain(rel, filter, verbose)` | Lance's plan of a scan |
@@ -375,9 +402,12 @@ by the next writer.
 
 Rows are not locked: two transactions that change the same row both
 proceed, and the one that commits second fails with a serialization failure
-(SQLSTATE 40001) -- retry it.  Writes to different rows never conflict.  A
-table with a unique index lets one writer at a time.  `PREPARE TRANSACTION`
-of a transaction that changed a lance table is refused.
+(SQLSTATE 40001) -- retry it.  Writes to different rows never conflict.
+Writers write side by side: a backend takes its rows' ids from
+`lance.rowid_seq` 65,536 at a time and keeps them across its transactions,
+and no writer waits for another's.  A table with a unique index lets one
+writer at a time.  `PREPARE TRANSACTION` of a transaction that changed a
+lance table is refused.
 
 ## Schema changes
 

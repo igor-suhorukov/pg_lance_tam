@@ -94,6 +94,7 @@ extern const TableAmRoutine *lt_tableam(void);
 extern struct LtReader *lt_scan_take_reader(TableScanDesc scan, struct LtReadSpec *spec);
 extern void lt_scan_reset_take(TableScanDesc scan);
 extern const TupleTableSlotOps *lt_slot_ops_of(void);
+extern char *lt_compaction_bounds(int nworkers);
 extern bool lt_is_lance_rel(Relation rel);
 extern bool lt_is_lance_relid(Oid relid);
 extern Oid	lt_am_oid(void);
@@ -138,7 +139,7 @@ extern void lt_catalog_delete(Oid relid);
 extern void lt_table_invalidate(Oid relid);
 extern char *lt_storage_json(List *options, const char *server, Oid owner);
 extern uint64 lt_next_rowid(void);
-extern void lt_rowids_floor(uint64 max_row_id);
+extern void lt_rowids_for(LeDataset *ds);
 extern void lt_lock_table_commit(Oid relid);
 
 /*

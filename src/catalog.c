@@ -1050,31 +1050,35 @@ lt_lock_table_commit(Oid relid)
 /*
  * The next row id: from a chunk of LT_ROWID_CHUNK ids this backend took
  * from lance.rowid_seq, whose every value is a chunk's first id.  Ids a
- * backend leaves unused are never given; ids are never reused.
+ * backend leaves unused are never given; ids are never reused.  A chunk
+ * taken starts above rowid_floor, the highest id of a dataset this backend
+ * has written: the chunks below it are passed over, nextval() after
+ * nextval(), so that the sequence only moves forward and its users never
+ * wait for each other -- nextval() holds RowExclusiveLock on it to the end
+ * of its transaction.
  */
 static uint64 rowid_next = 0;
 static uint64 rowid_end = 0;
+static uint64 rowid_floor = 0;
 
-static Oid
-rowid_seq(void)
+static void
+take_chunk(void)
 {
 	Oid			nsp = get_namespace_oid("lance", false);
 	Oid			seq = get_relname_relid("rowid_seq", nsp);
+	int64		start;
 
 	if (!OidIsValid(seq))
 		elog(ERROR, "lance_tam: lance.rowid_seq is missing");
-	return seq;
-}
-
-static void
-take_chunk(Oid seq)
-{
-	int64		start = nextval_internal(seq, false);
-
-	if (start < (int64) LT_ROWID_START || (uint64) start + LT_ROWID_CHUNK > LT_ROWID_LIMIT)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lance tables have no row ids left")));
+	do
+	{
+		CHECK_FOR_INTERRUPTS();
+		start = nextval_internal(seq, false);
+		if (start < (int64) LT_ROWID_START || (uint64) start + LT_ROWID_CHUNK > LT_ROWID_LIMIT)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("lance tables have no row ids left")));
+	} while ((uint64) start <= rowid_floor);
 	rowid_next = (uint64) start;
 	rowid_end = rowid_next + LT_ROWID_CHUNK;
 }
@@ -1083,58 +1087,36 @@ uint64
 lt_next_rowid(void)
 {
 	if (rowid_next >= rowid_end)
-		take_chunk(rowid_seq());
+		take_chunk();
 	return rowid_next++;
 }
 
 /*
- * The ids given from now on are above max_row_id, the highest a dataset
- * holds: a dataset can outlive the sequence -- the extension dropped and
- * made again, a dataset another server wrote.  The sequence only moves
- * forward, under a lock that keeps its other users' nextval() out.
+ * Before a transaction's first write of a dataset: the ids given from now
+ * on are none the dataset holds.  A dataset can hold ids the sequence has
+ * not given -- it outlived the sequence (the extension made again), another
+ * server wrote it -- so the backend's chunk is left when the dataset holds
+ * one of the ids it has left, and the chunks taken after it start above the
+ * dataset's highest id.  The ids a chunk has left are this backend's alone:
+ * another writer's rows above them, or the dataset's own rows below them,
+ * leave the chunk in use.
  */
 void
-lt_rowids_floor(uint64 max_row_id)
+lt_rowids_for(LeDataset *ds)
 {
-	Oid			seq;
-	HeapTuple	tup;
-	Oid			owner;
-	Oid			save_userid;
-	int			save_sec;
-	int64		target;
+	uint64		max_row_id;
+	bool		held;
+	LeError		err = {0};
 
-	if (max_row_id < LT_ROWID_START || (rowid_next > max_row_id && rowid_next < rowid_end))
+	if (lt_api()->row_ids_held(ds, rowid_next, rowid_end, &max_row_id, &held, &err) != LE_OK)
+		lt_raise(&err, "reading the dataset's row ids");
+	if (max_row_id < LT_ROWID_START)
 		return;
-	seq = rowid_seq();
-	LockRelationOid(seq, ExclusiveLock);
-	take_chunk(seq);
-	if (rowid_next > max_row_id)
-	{
-		UnlockRelationOid(seq, ExclusiveLock);
-		return;
-	}
-	target = (int64) (((max_row_id + 1) + LT_ROWID_CHUNK - 1) / LT_ROWID_CHUNK * LT_ROWID_CHUNK);
-	if ((uint64) target + LT_ROWID_CHUNK > LT_ROWID_LIMIT)
+	if ((max_row_id / LT_ROWID_CHUNK + 2) * LT_ROWID_CHUNK > LT_ROWID_LIMIT)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("the dataset's row ids leave no room for new rows")));
-	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(seq));
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for relation %u", seq);
-	owner = ((Form_pg_class) GETSTRUCT(tup))->relowner;
-	ReleaseSysCache(tup);
-	GetUserIdAndSecContext(&save_userid, &save_sec);
-	SetUserIdAndSecContext(owner, save_sec | SECURITY_LOCAL_USERID_CHANGE);
-	PG_TRY();
-	{
-		DirectFunctionCall3(setval3_oid, ObjectIdGetDatum(seq), Int64GetDatum(target),
-							BoolGetDatum(false));
-	}
-	PG_FINALLY();
-	{
-		SetUserIdAndSecContext(save_userid, save_sec);
-	}
-	PG_END_TRY();
-	take_chunk(seq);
-	UnlockRelationOid(seq, ExclusiveLock);
+	rowid_floor = Max(rowid_floor, max_row_id);
+	if (held)
+		rowid_next = rowid_end = 0;
 }

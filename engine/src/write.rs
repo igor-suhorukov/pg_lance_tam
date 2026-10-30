@@ -496,8 +496,7 @@ impl WriteState {
             }
             let ids = row_ids[next..next + n].to_vec();
             next += n;
-            let sequence = RowIdSequence::from(ids.as_slice());
-            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+            fragment.row_id_meta = Some(row_id_meta(&ids));
             fragment.id = 0;
             for f in &fragment.files {
                 self.written.push(format!("data/{}", f.path));
@@ -700,8 +699,7 @@ impl WriteState {
                 let mut f = pf.fragment.clone();
                 if pf.max_id > ROW_ID_MASK {
                     let ids: Vec<u64> = pf.row_ids.iter().map(|&id| id & ROW_ID_MASK).collect();
-                    let sequence = RowIdSequence::from(ids.as_slice());
-                    f.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence).into()));
+                    f.row_id_meta = Some(row_id_meta(&ids));
                 }
                 f
             })
@@ -977,6 +975,26 @@ impl WriteState {
             }
         }
     }
+}
+
+/// A fragment's row ids as its manifest keeps them, in the smaller of two
+/// encodings.  Writers taking chunks of ids side by side leave a fragment a
+/// run of ids a chunk, other writers' chunks between: as one segment, the
+/// whole span's bitmap or a sorted array of the ids, half a megabyte or
+/// more for a million rows, in every manifest after; as `Range` segments,
+/// which every reader reads, a few bytes a run.
+pub(crate) fn row_id_meta(ids: &[u64]) -> RowIdMeta {
+    let one = write_row_ids(&RowIdSequence::from(ids));
+    let mut runs = RowIdSequence::new();
+    let mut start = 0;
+    for i in 1..=ids.len() {
+        if i == ids.len() || ids[i] != ids[i - 1] + 1 {
+            runs.extend(RowIdSequence::from(ids[start]..ids[i - 1] + 1));
+            start = i;
+        }
+    }
+    let runs = write_row_ids(&runs);
+    RowIdMeta::Inline(if runs.len() < one.len() { runs } else { one }.into())
 }
 
 /// Open the base a transaction's first write is made on.

@@ -59,8 +59,10 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
+#include "postmaster/autovacuum.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
@@ -73,6 +75,8 @@
 #include "utils/tuplesort.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #include "lance_tam.h"
 
@@ -1170,82 +1174,251 @@ lt_relation_copy_for_cluster(Relation OldTable, Relation NewTable, Relation OldI
 }
 
 /*
- * VACUUM: Lance's maintenance of the dataset -- its small fragments
- * compacted, its indices brought up to its new rows, old versions removed
- * -- and the catalog set to the version it leaves.  It holds the table's
- * commit lock, so that no writer commits on the versions it replaces;
- * autovacuum passes a table whose lock another holds.
+ * What compaction may use, as PostgreSQL bounds VACUUM's parallelism and
+ * memory: its rewrite tasks run at once one and the workers a parallel
+ * VACUUM may have -- PARALLEL n, else max_parallel_maintenance_workers; for
+ * autovacuum, a table's autovacuum_parallel_workers, else
+ * autovacuum_max_parallel_workers, 0 by default -- and their scans read
+ * ahead maintenance_work_mem (autovacuum's autovacuum_work_mem) between
+ * them, in batches of lance.batch_rows rows.  nworkers is VacuumParams':
+ * 0 by default, -1 for PARALLEL 0.  A JSON object of optimize()'s options.
  */
-static void
-lt_relation_vacuum(Relation rel, const VacuumParams *params, BufferAccessStrategy bstrategy)
+char *
+lt_compaction_bounds(int nworkers)
 {
-	LtTable    *t;
+	bool		autovacuum = AmAutoVacuumWorkerProcess();
+	int			cap = autovacuum ? autovacuum_max_parallel_workers : max_parallel_maintenance_workers;
+	int			mem_kb = autovacuum && autovacuum_work_mem != -1 ? autovacuum_work_mem : maintenance_work_mem;
+	int			tasks = 1 + (nworkers < 0 ? 0 : nworkers > 0 ? Min(nworkers, cap) : cap);
+	int64		io_buffer = Max((int64) mem_kb * 1024 / tasks, (int64) 1024 * 1024);
+
+	return psprintf("{\"num_threads\": %d, \"io_buffer_size\": " INT64_FORMAT ", \"batch_size\": %d}",
+					tasks, io_buffer, lt_batch_rows);
+}
+
+#define VACUUM_LOCK_WAIT_MS		5000
+#define VACUUM_LOCK_INTERVAL_MS	50
+
+/*
+ * The table's commit lock, to the end of the transaction, for VACUUM.
+ * Autovacuum takes it only as it comes free, trying for VACUUM_LOCK_WAIT_MS
+ * as its truncation of a heap table tries for that table's lock, or not
+ * at all without "wait": it neither keeps a writer of the table waiting --
+ * which would cancel it -- nor waits long for one that holds the lock from
+ * its first write, a writer of a table with a unique index.
+ */
+static bool
+vacuum_lock_commit(Oid relid, bool wait)
+{
+	if (!AmAutoVacuumWorkerProcess())
+	{
+		lt_lock_table_commit(relid);
+		return true;
+	}
+	for (int waited = 0;; waited += VACUUM_LOCK_INTERVAL_MS)
+	{
+		if (ConditionalLockDatabaseObject(lt_catalog_relid(), relid, 0, ExclusiveLock))
+			return true;
+		if (!wait || waited >= VACUUM_LOCK_WAIT_MS)
+			return false;
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 VACUUM_LOCK_INTERVAL_MS, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * VACUUM's commit, under the table's commit lock: the compaction written on
+ * an earlier version, which Lance refuses when a commit since then deleted
+ * rows it rewrote -- it is then left for a later VACUUM -- then the
+ * indices brought up to new rows and old versions removed, and the catalog
+ * set to the version it leaves, whose manifest *info describes.  False when
+ * autovacuum could not take the lock.
+ */
+static bool
+vacuum_commit(Relation rel, LtTable *t, LeCompaction *c, int elevel, LeDatasetInfo *info)
+{
+	Oid			relid = RelationGetRelid(rel);
+	const LeApi *api = lt_api();
+	char	   *props;
+	uint64		catalog_version;
 	uint64		version;
 	uint64		new_version = 0;
 	LeDataset  *ds;
-	LeDatasetInfo info;
+	LeDataset  *volatile last;
 	LeError		err = {0};
 	char	   *result = NULL;
-	const LeApi *api;
-	bool		compact;
+	int			rc;
 
-	if (!lt_vacuum_compact)
-		return;
-	t = lt_table(rel);
-	if (!t->writable)
-		return;
-	api = lt_api();
-	if (AmAutoVacuumWorkerProcess())
+	if (!vacuum_lock_commit(relid, true))
+		return false;
+	props = lt_xact_properties(relid);
+	catalog_version = lt_catalog_version(relid, NULL);
+	version = lt_commit_base(relid, t->uri, t->storage_json, catalog_version, props);
+	if (c != NULL)
 	{
-		if (!ConditionalLockDatabaseObject(lt_catalog_relid(), RelationGetRelid(rel), 0, ExclusiveLock))
-			return;
-	}
-	else
-		lt_lock_table_commit(RelationGetRelid(rel));
-
-	version = lt_commit_base(RelationGetRelid(rel), t->uri, t->storage_json,
-							 lt_catalog_version(RelationGetRelid(rel), NULL),
-							 lt_xact_properties(RelationGetRelid(rel)));
-	ds = lt_open_dataset(t, version);
-	PG_TRY();
-	{
-		memset(&info, 0, sizeof(info));
-		if (api->dataset_info(ds, &info, &err) != LE_OK)
-			lt_raise(&err, "reading a lance table's dataset");
-		compact = info.num_fragments > 1 || info.num_deleted_rows > 0;
-		if (compact)
+		ds = lt_open_dataset(t, version);
+		/* the commit runs to its end, as a writer's does (xact.c) */
+		HOLD_INTERRUPTS();
+		rc = api->compact_commit(c, ds, &new_version, &result, &err);
+		RESUME_INTERRUPTS();
+		api->dataset_close(ds);
+		if (rc == LE_OK)
 		{
-			char	   *props = lt_xact_properties(RelationGetRelid(rel));
-
-			if (api->optimize(ds, NULL, props, &new_version, &result, &err) != LE_OK)
-				lt_raise(&err, "compacting a lance table");
+			version = new_version;
 			result = lt_take_string(result);
-			ereport(params->options & VACOPT_VERBOSE ? INFO : DEBUG1,
+			ereport(elevel,
 					(errmsg("lance table \"%s\": %s", RelationGetRelationName(rel),
 							result ? result : "")));
+		}
+		else if (rc == LE_ERR_CONFLICT)
+		{
+			ereport(elevel,
+					(errmsg("lance table \"%s\": compaction left for a later VACUUM",
+							RelationGetRelationName(rel)),
+					 errdetail_internal("%s", err.message ? err.message : "")));
+			api->free_string(err.message);
+		}
+		else
+			lt_raise(&err, "committing a lance table's compaction");
+	}
+
+	last = lt_open_dataset(t, version);
+	PG_TRY();
+	{
+		if (api->optimize(last, "{\"compact\": false}", props, &new_version, &result, &err) != LE_OK)
+			lt_raise(&err, "optimizing a lance table's indices");
+		result = lt_take_string(result);
+		if (new_version != version)
+		{
+			version = new_version;
+			ereport(elevel,
+					(errmsg("lance table \"%s\": %s", RelationGetRelationName(rel),
+							result ? result : "")));
+			ds = last;
+			last = NULL;
+			api->dataset_close(ds);
+			last = lt_open_dataset(t, version);
 		}
 		if (lt_version_retention >= 0)
 		{
 			char	   *cleaned = NULL;
 
-			if (api->cleanup(ds, lt_version_retention, &cleaned, &err) != LE_OK)
+			if (api->cleanup(last, lt_version_retention, &cleaned, &err) != LE_OK)
 				lt_warn(&err, "could not remove a lance table's old versions");
 			else
 			{
 				cleaned = lt_take_string(cleaned);
-				ereport(params->options & VACOPT_VERBOSE ? INFO : DEBUG1,
+				ereport(elevel,
 						(errmsg("lance table \"%s\" old versions: %s",
 								RelationGetRelationName(rel), cleaned ? cleaned : "")));
 			}
 		}
+		memset(info, 0, sizeof(*info));
+		if (api->dataset_info(last, info, &err) != LE_OK)
+			lt_raise(&err, "reading a lance table's dataset");
 	}
 	PG_FINALLY();
 	{
-		api->dataset_close(ds);
+		if (last)
+			api->dataset_close(last);
 	}
 	PG_END_TRY();
-	if (new_version > version || version != lt_catalog_version(RelationGetRelid(rel), NULL))
-		lt_catalog_set_version(RelationGetRelid(rel), Max(new_version, version));
+	if (version != catalog_version)
+		lt_catalog_set_version(relid, version);
+	return true;
+}
+
+/*
+ * VACUUM: Lance's maintenance of the dataset -- its small fragments
+ * compacted and deletions materialized, its indices brought up to its new
+ * rows, old versions removed -- and the table's statistics, as heap's
+ * VACUUM leaves them: autovacuum then counts the table's changes from this
+ * VACUUM on.  Compaction writes its new fragments on the catalog's version
+ * without the table's commit lock, as many tasks at once as
+ * lt_compaction_bounds() lets it, so that the table's writers keep
+ * committing while it rewrites; its commit takes the lock (vacuum_commit).
+ */
+static void
+lt_relation_vacuum(Relation rel, const VacuumParams *params, BufferAccessStrategy bstrategy)
+{
+	Oid			relid = RelationGetRelid(rel);
+	int			elevel = (params->options & VACOPT_VERBOSE) ? INFO : DEBUG1;
+	TimestampTz starttime = GetCurrentTimestamp();
+	LtTable    *t = lt_table(rel);
+	const LeApi *api;
+	LeDataset  *ds;
+	LeDatasetInfo info;
+	LeCompaction *c = NULL;
+	LeError		err = {0};
+	bool		done = true;
+
+	if (!t->writable)
+		return;
+	api = lt_api();
+	memset(&info, 0, sizeof(info));
+	if (lt_vacuum_compact)
+	{
+		/* autovacuum passes a table whose commit lock another holds */
+		if (AmAutoVacuumWorkerProcess())
+		{
+			if (!vacuum_lock_commit(relid, false))
+				return;
+			UnlockDatabaseObject(lt_catalog_relid(), relid, 0, ExclusiveLock);
+		}
+		ds = lt_open_dataset(t, lt_catalog_version(relid, NULL));
+		PG_TRY();
+		{
+			if (api->dataset_info(ds, &info, &err) != LE_OK)
+				lt_raise(&err, "reading a lance table's dataset");
+			if ((info.num_fragments > 1 || info.num_deleted_rows > 0) &&
+				api->compact_prepare(ds, lt_compaction_bounds(params->nworkers), &c, &err) != LE_OK)
+				lt_raise(&err, "compacting a lance table");
+		}
+		PG_FINALLY();
+		{
+			api->dataset_close(ds);
+		}
+		PG_END_TRY();
+
+		/* the files a compaction did not commit are removed */
+		PG_TRY();
+		{
+			done = vacuum_commit(rel, t, c, elevel, &info);
+		}
+		PG_FINALLY();
+		{
+			if (c)
+				api->compact_free(c, true);
+		}
+		PG_END_TRY();
+		if (!done)
+		{
+			ereport(elevel,
+					(errmsg("lance table \"%s\": not vacuumed, its commit lock is taken",
+							RelationGetRelationName(rel))));
+			return;
+		}
+	}
+	else
+	{
+		ds = lt_open_dataset(t, lt_catalog_version(relid, NULL));
+		if (api->dataset_info(ds, &info, &err) != LE_OK)
+		{
+			api->dataset_close(ds);
+			lt_raise(&err, "reading a lance table's dataset");
+		}
+		api->dataset_close(ds);
+	}
+
+	vac_update_relstats(rel,
+						(BlockNumber) Min((info.num_rows + LT_ROWS_PER_BLOCK - 1) / LT_ROWS_PER_BLOCK,
+										  (uint64) MaxBlockNumber),
+						(double) info.num_rows, 0, 0, rel->rd_rel->relhasindex,
+						InvalidTransactionId, InvalidMultiXactId, NULL, NULL, false);
+	pgstat_report_vacuum(rel, (PgStat_Counter) info.num_rows,
+						 (PgStat_Counter) info.num_deleted_rows, starttime);
 }
 
 /* ------------------------------------------------------------------------

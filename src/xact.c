@@ -178,7 +178,6 @@ lt_xact_write(Relation rel, LtXactTable *xt)
 	LtTable    *t;
 	uint64		version;
 	LeDataset  *ds;
-	LeDatasetInfo info;
 	LeWriteSpec spec;
 	LeError		err = {0};
 	const LeApi *api;
@@ -219,10 +218,7 @@ lt_xact_write(Relation rel, LtXactTable *xt)
 	ds = lt_open_dataset(t, version);
 	PG_TRY();
 	{
-		memset(&info, 0, sizeof(info));
-		if (api->dataset_info(ds, &info, &err) != LE_OK)
-			lt_raise(&err, "reading the dataset's row ids");
-		lt_rowids_floor(info.max_row_id);
+		lt_rowids_for(ds);
 
 		memset(&spec, 0, sizeof(spec));
 		spec.size = sizeof(spec);

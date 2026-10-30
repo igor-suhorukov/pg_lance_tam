@@ -37,7 +37,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LE_ABI_VERSION		2
+#define LE_ABI_VERSION		3
 
 /* Arrow's C Data Interface, as its specification defines it */
 #ifndef ARROW_C_DATA_INTERFACE
@@ -97,6 +97,7 @@ typedef struct LeError
 typedef struct LeDataset LeDataset; /* a dataset at one version */
 typedef struct LeScan LeScan;		/* a running scan */
 typedef struct LeWrite LeWrite;		/* one transaction's changes to a table */
+typedef struct LeCompaction LeCompaction;	/* compaction's files, not committed */
 
 typedef struct LeConfig
 {
@@ -349,6 +350,33 @@ typedef struct LeApi
 	int32_t		(*write_delete_read) (LeWrite *w, const uint64_t *row_ids, int64_t n,
 									  uint64_t version, int64_t cid, uint32_t subxid,
 									  LeError *err);
+
+	/*
+	 * The row ids of the version, deleted rows included: the highest a
+	 * fragment holds, or the one before Lance's own next row id, and
+	 * whether one of them, or one Lance gave, is in [lo, hi).
+	 */
+	int32_t		(*row_ids_held) (LeDataset *ds, uint64_t lo, uint64_t hi,
+								 uint64_t *max_row_id, bool *held, LeError *err);
+
+	/*
+	 * Compaction as optimize() makes it, planned on ds and its new
+	 * fragments written, without its commit: *out NULL when it has nothing
+	 * to do.  The options are optimize()'s.
+	 */
+	int32_t		(*compact_prepare) (LeDataset *ds, const char *options_json,
+									LeCompaction **out, LeError *err);
+	/*
+	 * The compaction committed on "latest", the newest version: a commit
+	 * since the version it was planned on that changed a fragment it
+	 * replaces makes it LE_ERR_CONFLICT, and its files are removed.  Once
+	 * called, compact_free() removes nothing.
+	 */
+	int32_t		(*compact_commit) (LeCompaction *c, LeDataset *latest,
+								   uint64_t *new_version, char **result_json,
+								   LeError *err);
+	/* forget it; with cleanup, remove the files it wrote and did not commit */
+	void		(*compact_free) (LeCompaction *c, bool cleanup);
 } LeApi;
 
 /* write_append's mark on a row id: a new version of the row (bits 0..39) */

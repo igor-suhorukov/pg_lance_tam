@@ -1,0 +1,90 @@
+-- VACUUM (docs/design.md §2.11): compaction writes its new fragments
+-- without the table's commit lock and commits them under it, so that a
+-- writer commits while VACUUM rewrites; a commit since then that deleted
+-- rows it rewrote leaves the compaction for a later VACUUM.  VACUUM leaves
+-- the statistics heap's VACUUM leaves.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS dblink;
+RESET client_min_messages;
+
+-- the table's statistics, from which autovacuum counts its changes (off
+-- for the tables here, which it would vacuum meanwhile)
+CREATE TABLE vs (id int, v int) USING lance WITH (autovacuum_enabled = off);
+INSERT INTO vs SELECT g, g FROM generate_series(1, 1000) g;
+INSERT INTO vs SELECT g, g FROM generate_series(1001, 2000) g;
+DELETE FROM vs WHERE id <= 300;
+SELECT pg_stat_force_next_flush();
+SELECT n_ins_since_vacuum, n_dead_tup, vacuum_count FROM pg_stat_user_tables WHERE relname = 'vs';
+VACUUM vs;
+SELECT n_ins_since_vacuum, n_live_tup, n_dead_tup, vacuum_count
+FROM pg_stat_user_tables WHERE relname = 'vs';
+SELECT reltuples, relpages FROM pg_class WHERE relname = 'vs';
+SELECT lance.table_info('vs')->>'fragments' AS fragments, lance.table_info('vs')->>'deleted_rows' AS deleted;
+DROP TABLE vs;
+
+-- a writer of a table with a unique index holds its commit lock from its
+-- first write: VACUUM rewrites meanwhile, and waits for the lock to commit
+CREATE TABLE vc (id int PRIMARY KEY, v int) USING lance WITH (autovacuum_enabled = off);
+INSERT INTO vc SELECT g, 0 FROM generate_series(1, 100) g;
+INSERT INTO vc SELECT g, 0 FROM generate_series(101, 200) g;
+INSERT INTO vc SELECT g, 0 FROM generate_series(201, 300) g;
+SELECT lance.table_info('vc')->>'fragments' AS fragments;
+SELECT dblink_connect('vac', 'dbname=' || current_database());
+SELECT * FROM dblink('vac', 'SELECT pg_backend_pid()') AS t(pid int) \gset vac_
+CREATE FUNCTION waits_for_lock(p int) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    FOR i IN 1..3000 LOOP
+        IF EXISTS (SELECT FROM pg_locks WHERE pid = p AND NOT granted) THEN
+            RETURN true;
+        END IF;
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+    RETURN false;
+END $$;
+
+-- an insert committed between the rewrite and its commit: both stay
+BEGIN;
+INSERT INTO vc VALUES (1000, 0);
+SELECT dblink_send_query('vac', 'VACUUM vc');
+SELECT waits_for_lock(:vac_pid);
+COMMIT;
+SELECT * FROM dblink_get_result('vac') AS t(status text);
+SELECT * FROM dblink_get_result('vac') AS t(status text);
+SELECT count(*), sum(id) FROM vc;
+SELECT lance.table_info('vc')->>'fragments' AS fragments;
+
+-- a delete committed between them: the row stays deleted
+BEGIN;
+DELETE FROM vc WHERE id = 1;
+SELECT dblink_send_query('vac', 'VACUUM vc');
+SELECT waits_for_lock(:vac_pid);
+COMMIT;
+SELECT * FROM dblink_get_result('vac') AS t(status text);
+SELECT * FROM dblink_get_result('vac') AS t(status text);
+SELECT count(*), count(*) FILTER (WHERE id = 1) AS deleted_row FROM vc;
+SELECT lance.table_info('vc')->>'fragments' AS fragments;
+
+-- an update in place committed between them: one version of the row
+BEGIN;
+UPDATE vc SET v = 7 WHERE id = 2;
+SELECT dblink_send_query('vac', 'VACUUM vc');
+SELECT waits_for_lock(:vac_pid);
+COMMIT;
+SELECT * FROM dblink_get_result('vac') AS t(status text);
+SELECT * FROM dblink_get_result('vac') AS t(status text);
+SELECT count(*), count(*) FILTER (WHERE id = 2) AS updated_row, sum(v) FROM vc;
+SET enable_seqscan = off;
+SET lance.enable_customscan = off;
+SELECT id, v FROM vc WHERE id = 2;
+RESET enable_seqscan;
+RESET lance.enable_customscan;
+
+-- with no writer, VACUUM compacts what was left
+VACUUM vc;
+SELECT count(*), count(DISTINCT ctid), sum(v) FROM vc;
+SELECT lance.table_info('vc')->>'fragments' AS fragments,
+       lance.table_info('vc')->>'deleted_rows' AS deleted;
+
+SELECT dblink_disconnect('vac');
+DROP FUNCTION waits_for_lock(int);
+DROP TABLE vc;

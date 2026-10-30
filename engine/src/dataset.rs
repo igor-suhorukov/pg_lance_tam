@@ -10,6 +10,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
+use lance_table::rowids::segment::U64Segment;
 
 use crate::error::{EResult, EngineError};
 use crate::rt::session;
@@ -123,13 +124,16 @@ pub struct Info {
     pub timestamp_us: i64,
 }
 
-/// The highest row id a fragment of the version holds, deleted rows
-/// included, or the one before Lance's own next row id: the server's
-/// allocator must stay above it.
-pub async fn max_row_id(ds: &Dataset) -> EResult<u64> {
-    let mut max = ds.manifest().next_row_id.saturating_sub(1);
+/// The row ids of the version, deleted rows included: the highest a
+/// fragment holds, or the one before Lance's own next row id, above which
+/// the server's allocator starts its new chunks; and whether one of them,
+/// or one Lance gave, is in `lo..hi`, the ids a backend's chunk has left.
+pub async fn row_ids_held(ds: &Dataset, lo: u64, hi: u64) -> EResult<(u64, bool)> {
+    let next = ds.manifest().next_row_id;
+    let mut max = next.saturating_sub(1);
+    let mut held = lo < hi && lo < next;
     if !ds.manifest().uses_stable_row_ids() {
-        return Ok(max);
+        return Ok((max, held));
     }
     for f in ds.manifest().fragments.iter() {
         if f.row_id_meta.is_none() {
@@ -140,9 +144,34 @@ pub async fn max_row_id(ds: &Dataset) -> EResult<u64> {
             if let Some(r) = segment.range() {
                 max = max.max(*r.end());
             }
+            held = held || segment_holds(segment, lo, hi);
         }
     }
-    Ok(max)
+    Ok((max, held))
+}
+
+/// Whether the segment holds an id in `lo..hi`: the first of its sorted
+/// ids at or above `lo` found by its position.
+fn segment_holds(segment: &U64Segment, lo: u64, hi: u64) -> bool {
+    match segment.range() {
+        Some(r) if *r.start() < hi && *r.end() >= lo => {}
+        _ => return false,
+    }
+    match segment {
+        U64Segment::Range(_) => true,
+        U64Segment::Array(_) => segment.iter().any(|id| (lo..hi).contains(&id)),
+        _ => {
+            let (mut a, mut b) = (0, segment.len());
+            while a < b {
+                let m = a + (b - a) / 2;
+                match segment.get(m) {
+                    Some(id) if id < lo => a = m + 1,
+                    _ => b = m,
+                }
+            }
+            segment.get(a).is_some_and(|id| id < hi)
+        }
+    }
 }
 
 /// What the manifest says of a version, without reading a data file: a
