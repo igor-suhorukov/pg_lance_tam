@@ -148,6 +148,8 @@ pub struct WriteState {
     buffer: Vec<PendingBatch>,
     buffered_rows: usize,
     buffered_bytes: usize,
+    /// Where each buffered row waits, by its id: its batch and row
+    buffered_ids: HashMap<u64, (u32, u32)>,
     pub fragments: Vec<PendingFragment>,
     inserts: Vec<Group>,
     deletes: Vec<Group>,
@@ -249,6 +251,7 @@ impl WriteState {
             buffer: Vec::new(),
             buffered_rows: 0,
             buffered_bytes: 0,
+            buffered_ids: HashMap::new(),
             fragments: Vec::new(),
             inserts: Vec::new(),
             deletes: Vec::new(),
@@ -395,6 +398,10 @@ impl WriteState {
         add_to_groups(&mut self.inserts, cid, subxid, 0, row_ids.iter().copied());
         self.buffered_rows += batch.num_rows();
         self.buffered_bytes += batch.get_array_memory_size();
+        let at = self.buffer.len() as u32;
+        for (i, &id) in row_ids.iter().enumerate() {
+            self.buffered_ids.insert(id, (at, i as u32));
+        }
         self.buffer.push(PendingBatch { batch, row_ids });
         if self.buffered_rows >= self.spec.buffer_rows || self.buffered_bytes >= self.spec.buffer_bytes {
             self.flush().await?;
@@ -535,6 +542,7 @@ impl WriteState {
         let buffer = std::mem::take(&mut self.buffer);
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
+        self.buffered_ids.clear();
         let mut batches = Vec::with_capacity(buffer.len());
         let mut row_ids = Vec::new();
         for b in buffer {
@@ -548,15 +556,25 @@ impl WriteState {
     /// the buffer is written out first, so that its rows are in fragments.
     pub async fn view(&mut self, cid: i64) -> EResult<OwnView> {
         self.flush().await?;
+        let (hide, deleted_committed, truncated) = self.hidden(cid);
+        Ok(OwnView {
+            fragments: self.fragments.iter().map(|f| f.scan_fragment()).collect(),
+            hide,
+            deleted_committed,
+            truncated,
+            versions: !self.generations.is_empty(),
+        })
+    }
+
+    /// What command `cid` does not see of the transaction's rows -- those
+    /// of its later commands, of subtransactions rolled back, and those
+    /// deleted before it -- the committed rows among the deleted, and
+    /// whether a TRUNCATE before it hides every committed row.  SnapshotAny's
+    /// (cid < 0) sees every row version there is, none deleted.  The buffer
+    /// stays where it is: a take finds its rows there (`locate_buffered`).
+    pub fn hidden(&self, cid: i64) -> (RoaringTreemap, RoaringTreemap, bool) {
         if cid < 0 {
-            // SnapshotAny's: every row version there is, none deleted.
-            return Ok(OwnView {
-                fragments: self.fragments.iter().map(|f| f.scan_fragment()).collect(),
-                hide: self.aborted.clone(),
-                deleted_committed: RoaringTreemap::new(),
-                truncated: false,
-                versions: !self.generations.is_empty(),
-            });
+            return (self.aborted.clone(), RoaringTreemap::new(), false);
         }
         let truncate = self.truncates.iter().filter(|t| t.0 < cid).map(|t| t.0).max();
         let mut hide = self.aborted.clone();
@@ -572,13 +590,7 @@ impl WriteState {
             }
         }
         hide |= &deleted;
-        Ok(OwnView {
-            fragments: self.fragments.iter().map(|f| f.scan_fragment()).collect(),
-            hide,
-            deleted_committed: deleted,
-            truncated: truncate.is_some(),
-            versions: !self.generations.is_empty(),
-        })
+        (hide, deleted, truncate.is_some())
     }
 
     /// Where a row the transaction appended lies: its fragment and offset.
@@ -589,6 +601,16 @@ impl WriteState {
             }
         }
         None
+    }
+
+    /// Where a row the transaction appended waits in memory, not yet
+    /// written: its batch and row.
+    pub fn locate_buffered(&self, row_id: u64) -> Option<(usize, usize)> {
+        self.buffered_ids.get(&row_id).map(|&(b, r)| (b as usize, r as usize))
+    }
+
+    pub fn buffered_batch(&self, i: usize) -> &RecordBatch {
+        &self.buffer[i].batch
     }
 
     pub fn base(&self) -> Arc<Dataset> {

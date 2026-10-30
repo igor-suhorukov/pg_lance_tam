@@ -2,14 +2,15 @@
 //! Scans and takes (docs/design.md §2.8): Lance's scanner over a version,
 //! with the transaction's own fragments added and its deleted rows left out;
 //! the batches decoded by a task of the runtime ahead of the caller, who
-//! takes them one at a time.
+//! takes them one at a time.  A take reads the transaction's rows that wait
+//! in memory where they are; a scan has them written out first.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float16Array, Float32Array, Float64Array, RecordBatch, UInt8Array,
-    UInt64Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::Field;
 use futures::TryStreamExt;
@@ -490,31 +491,50 @@ pub async fn take(ds: Arc<Dataset>, spec: ScanSpec, row_ids: Vec<u64>) -> EResul
     let mut truncated = false;
     if let Some(w) = &spec.write {
         crate::trace!("take: locking the write state");
-        let mut w = w.lock().await;
-        crate::trace!("take: view of cid {}", spec.cid);
-        let view = w.view(spec.cid).await?;
-        crate::trace!("take: viewed, {} own fragments", view.fragments.len());
-        truncated = view.truncated;
-        // The transaction's own rows, by fragment and offset.
+        let w = w.lock().await;
+        // The buffer is not written out for a take, as for a scan: an
+        // UPDATE's fetch after each row it changed would write a fragment
+        // a row.
+        let (hide, _, view_truncated) = w.hidden(spec.cid);
+        truncated = view_truncated;
+        // The transaction's own rows: by fragment and offset, and those that
+        // wait in memory by buffered batch and row.
         let mut by_fragment: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
+        let mut by_batch: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
         // A row updated in place: the version the command sees
         for &id in &row_ids {
             let version = w.resolve(id, spec.cid);
-            if view.hide.contains(version) {
+            if hide.contains(version) {
                 continue;
             }
-            match w.locate(version) {
-                Some((fi, pos)) => by_fragment.entry(fi).or_default().push((pos as u32, id)),
-                None if version == id => committed.push(id),
-                None => {}
+            if let Some((fi, pos)) = w.locate(version) {
+                by_fragment.entry(fi).or_default().push((pos as u32, id));
+            } else if let Some((bi, row)) = w.locate_buffered(version) {
+                by_batch.entry(bi).or_default().push((row as u32, id));
+            } else if version == id {
+                committed.push(id);
             }
         }
+        crate::trace!(
+            "take: rows in {} own fragments and {} buffered batches",
+            by_fragment.len(),
+            by_batch.len()
+        );
         for (fi, mut rows) in by_fragment {
             rows.sort_unstable();
             let offsets: Vec<u32> = rows.iter().map(|r| r.0).collect();
             let fragment = w.fragments[fi].scan_fragment();
             let ff = FileFragment::new(w.base(), fragment);
             let batch = ff.take(&offsets, &projection).await?;
+            let part = parts.len();
+            for (i, (_, id)) in rows.iter().enumerate() {
+                found.insert(*id, (part, i));
+            }
+            parts.push(batch);
+        }
+        for (bi, rows) in by_batch {
+            let indices = UInt32Array::from(rows.iter().map(|r| r.0).collect::<Vec<u32>>());
+            let batch = arrow_select::take::take_record_batch(w.buffered_batch(bi), &indices)?;
             let part = parts.len();
             for (i, (_, id)) in rows.iter().enumerate() {
                 found.insert(*id, (part, i));

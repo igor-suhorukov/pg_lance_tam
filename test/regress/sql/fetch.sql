@@ -78,3 +78,39 @@ SET LOCAL lance.fetch_ahead = 0;
 SELECT count(*), sum(id), count(note) FROM fk_child WHERE ctid = ANY ((SELECT a[1:1000] FROM child_tids)::tid[]);
 ROLLBACK;
 DROP TABLE fk_child, fk_parent;
+
+-- the transaction's own rows that wait in memory are fetched there, not
+-- written out first: an UPDATE through an index writes no fragment a row,
+-- and sees what a heap table's sees
+CREATE TABLE up (id int NOT NULL, k int, v text) USING lance;
+CREATE TABLE up_heap (id int NOT NULL, k int, v text);
+INSERT INTO up SELECT g, g % 10, 'v' || g FROM generate_series(1, 3000) g;
+INSERT INTO up_heap SELECT * FROM up;
+CREATE INDEX up_id ON up (id);
+CREATE INDEX up_heap_id ON up_heap (id);
+SELECT (lance.table_info('up')->>'fragments')::int AS up_fragments \gset
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET lance.enable_customscan = off;
+BEGIN;
+UPDATE up SET v = 'x' || id WHERE id BETWEEN 1 AND 300;
+UPDATE up_heap SET v = 'x' || id WHERE id BETWEEN 1 AND 300;
+UPDATE up SET k = k + 100 WHERE id BETWEEN 101 AND 200;
+UPDATE up_heap SET k = k + 100 WHERE id BETWEEN 101 AND 200;
+DELETE FROM up WHERE id BETWEEN 191 AND 200;
+DELETE FROM up_heap WHERE id BETWEEN 191 AND 200;
+SAVEPOINT s;
+UPDATE up SET v = 'gone' WHERE id BETWEEN 1 AND 50;
+UPDATE up_heap SET v = 'gone' WHERE id BETWEEN 1 AND 50;
+ROLLBACK TO SAVEPOINT s;
+EXPLAIN (COSTS OFF) SELECT sum(k) FROM up WHERE id BETWEEN 1 AND 300;
+SELECT (SELECT array[count(*), sum(k), sum(length(v))] FROM up WHERE id BETWEEN 1 AND 300) =
+       (SELECT array[count(*), sum(k), sum(length(v))] FROM up_heap WHERE id BETWEEN 1 AND 300) AS same_in_transaction;
+COMMIT;
+SELECT (lance.table_info('up')->>'fragments')::int - :up_fragments AS fragments_added;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET lance.enable_customscan;
+SELECT (SELECT array[count(*), sum(k), sum(length(v))] FROM up) =
+       (SELECT array[count(*), sum(k), sum(length(v))] FROM up_heap) AS same_after_commit;
+DROP TABLE up, up_heap;
