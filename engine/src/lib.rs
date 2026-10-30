@@ -24,7 +24,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use crate::dataset::LeDataset;
 use crate::error::{EngineError, LE_ERR_INVALID};
 use crate::ffi::*;
-use crate::rt::run;
+use crate::rt::{run, run_here};
 use crate::scan::{LeScan, ScanSpec};
 use crate::write::{LeWrite, RowState, Spec};
 
@@ -101,7 +101,10 @@ unsafe extern "C" fn le_dataset_open(
             let uri = req_str(uri, "the uri")?.to_string();
             let opts = options_arg(options)?;
             let v = (version >= 0).then_some(version as u64);
-            let ds = run(async move { dataset::open(&uri, &opts, v).await })?;
+            let ds = match v.and_then(|v| dataset::open_cached(&uri, &opts, v)) {
+                Some(ds) => ds,
+                None => run(async move { dataset::open(&uri, &opts, v).await })?,
+            };
             *out = Box::into_raw(Box::new(LeDataset::new(ds)));
             Ok(())
         })
@@ -428,7 +431,7 @@ unsafe extern "C" fn le_take(
             } else {
                 Vec::new()
             };
-            let batch = run(async move { scan::take(d, spec, ids).await })?;
+            let batch = run_here(async move { scan::take(d, spec, ids).await })?;
             types::export_batch(batch, array, schema)
         })
     }

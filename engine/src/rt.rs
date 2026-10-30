@@ -7,10 +7,13 @@
 //! the library makes blocks every signal: the runtime is built while the
 //! calling thread blocks them, so its workers inherit the mask, and each
 //! thread blocks them again as it starts.  Lance's own pools are made
-//! lazily by code that runs on those workers, and inherit it too, because
-//! Lance's code never runs on the calling thread: a call spawns its work on
-//! the runtime and the calling thread waits for the answer on a channel,
-//! reading the server's cancel flags as it waits.
+//! lazily by code that runs on those workers, and inherit it too: a call
+//! spawns its work on the runtime and the calling thread waits for the
+//! answer on a channel, reading the server's cancel flags as it waits.  A
+//! take, short and waited for anyway, runs on the calling thread instead
+//! (`run_here`), with every signal blocked for its course, so that a pool
+//! made on the way inherits the mask all the same and the server's
+//! signals wait until it returns.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -137,6 +140,55 @@ pub fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         s.clone()
     } else {
         "a panic with no message".to_string()
+    }
+}
+
+/// The calling thread's signal mask, restored when dropped, an unwinding
+/// panic's too.
+struct SignalMask(libc::sigset_t);
+
+impl SignalMask {
+    /// Block every signal, keeping the mask they were blocked from
+    fn block_all() -> Self {
+        // SAFETY: plain libc calls on local sets
+        unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+            SignalMask(old)
+        }
+    }
+}
+
+impl Drop for SignalMask {
+    fn drop(&mut self) {
+        // SAFETY: the mask pthread_sigmask gave
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Run a short future on the calling thread, the runtime's tasks it spawns
+/// on the runtime: a take, which a fetch by TID waits for anyway, saved
+/// the two hand-offs between threads of `run` (about 10 us of 0.1 ms).
+/// Every signal stays blocked until it returns: a thread made on the way
+/// -- a pool of Lance's, the runtime's blocking threads -- inherits the
+/// mask, as from a worker, and the server's signals, a cancel among them,
+/// are delivered when it returns.
+pub fn run_here<F, T>(fut: F) -> EResult<T>
+where
+    F: Future<Output = EResult<T>>,
+{
+    let engine = engine()?;
+    let _mask = SignalMask::block_all();
+    match engine.rt.block_on(AssertUnwindSafe(fut).catch_unwind()) {
+        Ok(result) => result,
+        Err(panic) => Err(EngineError::new(
+            LE_ERR_PANIC,
+            format!("panic in the engine library: {}", panic_message(panic)),
+        )),
     }
 }
 

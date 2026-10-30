@@ -88,6 +88,12 @@ pub fn cache_forget(uri: &str) {
     }
 }
 
+/// A dataset at a version opened before, from the cache: no task and no
+/// wait, which a fetch by TID would pay for every row it fetches.
+pub fn open_cached(uri: &str, options: &HashMap<String, String>, version: u64) -> Option<Arc<Dataset>> {
+    cache_get(&(uri.to_string(), version, options_hash(options)))
+}
+
 /// Open a dataset at a version, or at its latest when `version` is None.
 pub async fn open(
     uri: &str,
