@@ -7,11 +7,11 @@
 # every leg runs there.  Nothing is built or installed on the host; the tree
 # is bind-mounted read-only (test/run.sh).
 #
-#   PG_IMAGE=postgres:19rc1-trixie   the server: PostgreSQL 19rc1 as the
+#   PG_IMAGE=postgres:19.0-trixie    the server: PostgreSQL 19.0 as the
 #                                    PostgreSQL Global Development Group
 #                                    packages it for Debian trixie, built
 #                                    without assertions and with LLVM's JIT
-#                                    -- the build PostGIS's 19rc1 image runs;
+#                                    -- the build PostGIS's 19-3.7 image runs;
 #                                    trixie is the engine builder's release,
 #                                    so that the engine library asks for no
 #                                    newer glibc than the server has
@@ -40,8 +40,15 @@
 #                             from the source release of the server's
 #                             version, checked against its SHA-256 as
 #                             ftp.postgresql.org gives it
+#
+# apt takes Debian's and PGDG's archives over HTTPS: plain HTTP to
+# deb.debian.org stalls behind some networks, every stalled request a 30 s
+# timeout.  The image has no CA certificates, so ca-certificates itself
+# comes over TLS unverified -- apt checks the archives' signed InRelease and
+# every package's hash whatever the transport, as it did over HTTP -- and
+# every package after it over verified TLS.
 
-ARG PG_IMAGE=postgres:19rc1-trixie
+ARG PG_IMAGE=postgres:19.0-trixie
 
 FROM ${PG_IMAGE}
 USER root
@@ -52,9 +59,10 @@ RUN set -eu; \
     pkgs="postgresql-server-dev-$PG_MAJOR=$PG_VERSION build-essential git ca-certificates curl bzip2 \
           perl libipc-run-perl diffutils procps gdb python3 python3-venv python3-pip"; \
     export DEBIAN_FRONTEND=noninteractive; \
-    apt-get update; \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/*; \
+    apt-get -o Acquire::https::Verify-Peer=false update; \
+    apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends ca-certificates; \
     if ! apt-get install -y --no-install-recommends $pkgs; then \
-        apt-get install -y --no-install-recommends ca-certificates; \
         . /etc/os-release; \
         echo "deb [ signed-by=/usr/local/share/keyrings/postgres.gpg.asc ] https://apt-archive.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg-archive main" \
             >/etc/apt/sources.list.d/pgdg-archive.list; \

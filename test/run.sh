@@ -42,8 +42,8 @@
 #   LT_TESTS      the suite's tests, all by default
 #   LT_PG_ACCEL   pg_accel's tree, for vexec
 #   LT_RUN        repro: the run directory that holds repro1.sql
-#   LT_DEV_IMAGE  the image the legs run on: lance_tam/dev:19rc1-trixie;
-#                 lance_tam/dev:19rc1-assert for assertions
+#   LT_DEV_IMAGE  the image the legs run on: lance_tam/dev:19.0-trixie;
+#                 lance_tam/dev:19.0-assert for assertions
 set -u -o pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

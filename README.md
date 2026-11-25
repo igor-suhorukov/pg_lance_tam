@@ -19,14 +19,14 @@ and works all the same.
 
 ## Status
 
-As of 2026-10-30, built and tested against:
+As of 2026-11-25, built and tested against:
 
 | | |
 |---|---|
-| PostgreSQL | 19rc1: PGDG's packages (`19~rc1-1.pgdg13+1`) in Docker Hub's `postgres:19rc1-trixie`, without assertions -- the build PostGIS's 19rc1 image runs -- and the same release built from source with assertions (`lance_tam/dev:19rc1-assert`) |
+| PostgreSQL | 19.0: PGDG's packages (`19.0-2.pgdg13+1`) in Docker Hub's `postgres:19.0-trixie`, without assertions -- the build PostGIS's `19-3.7` image runs -- and the same release built from source with assertions (`lance_tam/dev:19.0-assert`) |
 | Lance | Rust crates `15.0.0-beta.7`, from the tag `v15.0.0-beta.7` of Lance's repository: crates.io has no release of 15 yet |
 | pgvector | 0.8.7 |
-| pylance | 14.0.2 from PyPI, for the interop leg, which passes on Lance's pre-release 15.0.0b7 too |
+| pylance | 14.0.3 from PyPI, for the interop leg, which passed on Lance's pre-release 15.0.0b7 too |
 | pg_vexec | the batch source and sink contracts of pg_vexec's tree (optional) |
 
 - Every leg of `test/run.sh` passes, on both builds: `checks` (the ABI's two
@@ -50,7 +50,15 @@ As of 2026-10-30, built and tested against:
   referenced row while the foreign key's check holds the unique index's
   page locked -- passes since UPDATEs keep TIDs in place: a lance UPDATE
   used to insert into that page, and the backend waited on its own lock.
-- Moving from Lance 14.0.0-beta.19 to 15.0.0-beta.7 changed none of this:
+- On 19.0, PGDG's build and the build with assertions alike, all 243
+  files run with no crash, failed assertion or PANIC, and the same 120
+  differ on both: the 117 of 19rc1 by count, and three of the four files
+  19rc2 added.  `portals_inflight` passes; `alter_column_type` and
+  `rowtypes_alter` change columns' types, which lance tables refuse, and
+  `attribute_version` reads composite values stored before `ALTER TYPE`
+  added an attribute, which a lance table keeps as text that no longer
+  reads ([Limits](#limits)).
+- Moving from Lance 14.0.0-beta.19 to 15.0.0-beta.7 on 19rc1 changed none of this:
   every leg passes on both builds, and the same 117 files differ, their
   output the same but for TIDs, `now()`, pointers and one count of `stats`.
   A dataset the earlier Lance wrote reads the same, and takes writes,
@@ -600,15 +608,15 @@ Everything builds and runs in containers (`docker/`, `test/run.sh`); the
 host needs Docker with Compose v2.  `engine/Cargo.lock` pins Lance's crates
 and every other crate of the engine.
 Each run's results go to `~/.cache/pg_vexec/lance_tam/runs/<time>-<leg>`.
-The dev image is Docker Hub's `postgres:19rc1-trixie` with PGXS at the
+The dev image is Docker Hub's `postgres:19.0-trixie` with PGXS at the
 server's own version; `LT_PG_TAG` names another tag of that image (a later
 19 release), `LT_UID` the uid the server runs as (the host user's, 1000).
-`LT_DEV_IMAGE=lance_tam/dev:19rc1-assert` runs a leg on PostgreSQL built
+`LT_DEV_IMAGE=lance_tam/dev:19.0-assert` runs a leg on PostgreSQL built
 from the same release with `--enable-cassert` (`docker/Dockerfile.assert`).
 
 ```
-test/run.sh images     # the engine builder and the dev image (postgres:19rc1-trixie, pgvector, pylance)
-test/run.sh assert-image  # the dev image with assertions: 19rc1 built from its source release
+test/run.sh images     # the engine builder and the dev image (postgres:19.0-trixie, pgvector, pylance)
+test/run.sh assert-image  # the dev image with assertions: 19.0 built from its source release
 test/run.sh fetch      # cargo fetch: Lance's repository and the crates, at the lockfile's versions
 test/run.sh lock       # cargo update: the newest versions Cargo.toml allows, in the engine cache's Cargo.lock
 test/run.sh engine     # liblance_engine.so, into ~/.cache/pg_vexec/lance_tam/engine/lib

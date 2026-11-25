@@ -7,7 +7,7 @@
 # trixie, the engine builder's release, so that the engine library asks for
 # no newer glibc than the server has.
 #
-#   PG_VERSION=19rc1   the source release, checked against its SHA-256 as
+#   PG_VERSION=19.0    the source release, checked against its SHA-256 as
 #                      ftp.postgresql.org gives it
 #   LT_UID=1000        postgres's uid and gid, the host user's
 #
@@ -16,13 +16,24 @@
 # interop leg, and PostgreSQL's own regression suite and the libraries it
 # loads (regress, and contrib/spi's refint and autoinc) in /cb/pgregress for
 # the pgregress leg.
+#
+# apt takes Debian's archive over HTTPS: plain HTTP to deb.debian.org stalls
+# behind some networks, every stalled request a 30 s timeout.  The image has
+# no CA certificates, so ca-certificates itself comes over TLS unverified --
+# apt checks the archive's signed InRelease and every package's hash
+# whatever the transport, as it did over HTTP -- and every package after it
+# over verified TLS.
 
 FROM debian:trixie
-ARG PG_VERSION=19rc1
+ARG PG_VERSION=19.0
 ARG PGVECTOR_REF=v0.8.7
 ARG LT_UID=1000
 
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/* \
+    && apt-get -o Acquire::https::Verify-Peer=false update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends \
+        ca-certificates \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         build-essential bison flex pkg-config ca-certificates curl bzip2 git \
         libreadline-dev zlib1g-dev libssl-dev libicu-dev libxml2-dev libxslt1-dev liblz4-dev \
         libzstd-dev perl libipc-run-perl diffutils procps gdb locales \
